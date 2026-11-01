@@ -101,7 +101,8 @@ UCX_NET_DEVICES=mlx5_0:1 python3 bench/bench.py --rdma
 ```
 
 It needs `nats-server`, FUSE, and Python 3.10 or later; nothing outside its standard
-library.
+library. `--rview-fs-args` passes more arguments to both rview-fs, such as
+`"--cache-gib 1"` to measure fetches that reuse memory the cache freed.
 
 The results below are medians of 3 runs, on one host:
 
@@ -179,9 +180,10 @@ What it shows:
     8 readers. A random 4 KiB read takes 11–19 µs. From the page cache, reads run at 8 GB/s.
   - Touching a mapped file: the first touch fetches the whole file, and a later touch of a
     new page takes 60 µs.
-- **On one host, TCP and RDMA fetch at the same rate.** The link doesn't set it; the cost
-  per file does: copying into staged memory, fetching into memory, and serving through
-  FUSE. Between hosts, the link adds its own limits, which these numbers do not show.
+- **On one host, TCP and RDMA fetch at the same rate.** Over RDMA, a 64 MiB fetch spends
+  about 16 ms copying the file out of registered memory, and about 20 ms on the transfer
+  itself, which runs at about 3 GB/s here: a quarter of the link. Between hosts, the link
+  adds its own limits, which these numbers do not show.
 
 ## Building and testing
 

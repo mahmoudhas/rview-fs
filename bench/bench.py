@@ -320,6 +320,7 @@ def main() -> None:
     parser.add_argument("--rview-fs", default="target/release/rview-fs", help="the binary")
     parser.add_argument("--nats-server", default=shutil.which("nats-server"), help="the binary")
     parser.add_argument("--rdma", action="store_true", help="run rview-fs with --rdma (a --features ucx build)")
+    parser.add_argument("--rview-fs-args", default="", help="more arguments for both rview-fs, as one string")
     parser.add_argument("--file-mib", type=int, default=64, help="size of the big files")
     parser.add_argument("--files", type=int, default=8, help="big files in each set")
     parser.add_argument("--small", type=int, default=2000, help="small files to stat and list")
@@ -340,7 +341,7 @@ def main() -> None:
     nats = Nats(args.nats_server)
     nodes: list[Node] = []
     try:
-        extra = ["--rdma"] if args.rdma else []
+        extra = (["--rdma"] if args.rdma else []) + args.rview_fs_args.split()
         nodes += [Node(work, "a", nats, args.rview_fs, extra), Node(work, "b", nats, args.rview_fs, extra)]
         a, b = nodes
         for node, other in ((a, b), (b, a)):  # until each knows the other, it shows none of its files

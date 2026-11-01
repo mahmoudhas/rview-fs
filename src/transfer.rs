@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use velo::{DataHandle, Handler, InstanceId, TypedContext, Velo, WeakVelo};
 
+use crate::content::{self, Content};
 use crate::path::RelPath;
 
 pub const LIST: &str = "rview_list";
@@ -329,22 +330,18 @@ pub async fn unstage(velo: &Velo, instance: InstanceId, staged: Staged) -> anyho
         .context("releasing a stage")
 }
 
-/// Read a staged file into our memory.
-pub async fn fetch(velo: &Velo, staged: Staged) -> anyhow::Result<Bytes> {
-    // A node that hangs rather than goes would hold the read, and the page fault behind
-    // it, forever.
-    let (bytes, lease) = tokio::time::timeout(CALL_TIMEOUT, velo.get(staged.handle))
+/// Read a staged file into a new memfd named `name`.
+pub async fn fetch(velo: &Velo, staged: Staged, name: &str) -> anyhow::Result<Content> {
+    let (file, mut map) = content::memfd(name, staged.size).context("making a memfd")?;
+    let mut dest: &mut [u8] = map.as_deref_mut().unwrap_or_default();
+    // A node that hangs rather than goes would hold the open or the read, and the page
+    // fault behind it, forever.
+    let lease = tokio::time::timeout(CALL_TIMEOUT, velo.get_into(staged.handle, &mut dest))
         .await
         .with_context(|| format!("no reply in {CALL_TIMEOUT:?} reading a staged file"))?
         .context("reading a staged file")?;
     velo.release(staged.handle, lease).await?;
-    anyhow::ensure!(
-        bytes.len() as u64 == staged.size,
-        "staged {} bytes, read {}",
-        staged.size,
-        bytes.len()
-    );
-    Ok(bytes)
+    Ok(Content::new(file, map)?)
 }
 
 #[cfg(test)]

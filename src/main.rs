@@ -1,6 +1,9 @@
 //! Mount the union of the directory each machine of a group exports, read-only, with
-//! files of other machines read into host memory when first touched. Run one on every
-//! machine of the group, with the same NATS subject.
+//! files of other machines fetched into host memory. Run one on every machine of the
+//! group, with the same NATS subject.
+//!
+//! It runs on Linux 6.14: FUSE over io_uring, which it turns on, passthrough, and RDMA.
+//! Without passthrough or RDMA it goes on, slower, and says so loudly (health.rs).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -14,7 +17,9 @@ use parking_lot::RwLock;
 use prometheus::Registry;
 use rview_fs::cache::ContentCache;
 use rview_fs::fs::RviewFs;
+use rview_fs::health::{self, Degraded};
 use rview_fs::index::{Index, NodeId};
+use rview_fs::passthrough::Passthrough;
 use rview_fs::state::State;
 use rview_fs::{sync, transfer};
 use tokio::signal::unix::{SignalKind, signal};
@@ -22,7 +27,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use velo::observability::VeloMetrics;
 use velo::transports::tcp::TcpTransportBuilder;
-use velo::{ShutdownPolicy, Velo};
+use velo::{ShutdownPolicy, Velo, VeloBuilder};
 
 #[derive(Parser, Debug)]
 #[command(about = "Mount the union of the directory each machine of a group exports, read-only")]
@@ -50,6 +55,13 @@ struct Args {
     /// it, another machine cannot open a file of this one until stages are taken.
     #[arg(long, default_value_t = 16.0)]
     stage_gib: f64,
+    /// Serve every read itself, instead of having the kernel read files directly (FUSE
+    /// passthrough).
+    #[arg(long)]
+    no_passthrough: bool,
+    /// Move files between machines over TCP, not RDMA.
+    #[arg(long)]
+    no_rdma: bool,
     /// Where velo listens for the other machines.
     #[arg(long, default_value = "0.0.0.0:0")]
     bind: SocketAddr,
@@ -60,16 +72,15 @@ struct Args {
     /// and every one gets this many 1 MiB buffers before the mount serves all CPUs.
     #[arg(long, default_value_t = 8)]
     fuse_queue_depth: u16,
-    /// Move files between machines over RDMA (UCX).
-    #[cfg(feature = "ucx")]
-    #[arg(long)]
-    rdma: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            // fractal-fuse warns of every request it has no handler for, and programs make
+            // one on every open (Python asks isatty), which the kernel passes on.
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,fractal_fuse::dispatch=error".into()),
         )
         .init();
     let args = Args::parse();
@@ -93,7 +104,35 @@ fn detach(mount: &Path) -> std::io::Result<std::process::ExitStatus> {
         .status()
 }
 
-async fn build_velo(args: &Args, metrics: Arc<VeloMetrics>) -> anyhow::Result<(Velo, bool)> {
+/// FUSE over io_uring, the only way fractal-fuse serves a mount: Linux 6.14 has it, off
+/// unless this parameter is turned on.
+const ENABLE_URING: &str = "/sys/module/fuse/parameters/enable_uring";
+
+fn turn_on_fuse_over_io_uring() -> anyhow::Result<()> {
+    let was = match std::fs::read_to_string(ENABLE_URING) {
+        Ok(was) => was,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "this kernel has no FUSE over io_uring ({ENABLE_URING} is missing): rview-fs needs \
+             Linux 6.14 or later built with CONFIG_FUSE_IO_URING"
+        ),
+        Err(e) => return Err(e).with_context(|| format!("reading {ENABLE_URING}")),
+    };
+    if was.trim() == "Y" {
+        return Ok(());
+    }
+    std::fs::write(ENABLE_URING, "Y").with_context(|| {
+        format!(
+            "FUSE over io_uring is off, and turning it on failed: as root, echo Y > {ENABLE_URING}"
+        )
+    })?;
+    tracing::info!(
+        "turned on FUSE over io_uring ({ENABLE_URING} was {})",
+        was.trim()
+    );
+    Ok(())
+}
+
+fn tcp_velo(args: &Args, metrics: Arc<VeloMetrics>) -> anyhow::Result<VeloBuilder> {
     let listener =
         std::net::TcpListener::bind(args.bind).with_context(|| format!("binding {}", args.bind))?;
     let tcp = Arc::new(
@@ -101,31 +140,66 @@ async fn build_velo(args: &Args, metrics: Arc<VeloMetrics>) -> anyhow::Result<(V
             .from_listener(listener)?
             .build()?,
     );
-    let builder = Velo::builder().add_transport(tcp).metrics(metrics);
-    #[cfg(feature = "ucx")]
-    if args.rdma {
-        use velo::RdmaConfig;
-        use velo::transports::ucx::UcxTransportBuilder;
+    Ok(Velo::builder().add_transport(tcp).metrics(metrics))
+}
 
-        let ucx = Arc::new(UcxTransportBuilder::new().build()?);
-        let staged = (args.stage_gib * f64::from(1u32 << 30)) as u64;
-        let mut rdma = RdmaConfig::default();
-        // A file is staged by copying it into registered memory. Pooled arenas are
-        // registered once and reused; velo would give every file of 64 MiB or more an
-        // arena of its own, registered for it and unmapped only by a later sweep, which
-        // makes staging slow and soon spends the budget, past which it stages over TCP.
-        rdma.pool.dedicated_arena_min = u64::MAX;
-        // What transfer.rs stages at once, and the pool's rounding up of it (< 12.5%).
-        rdma.pool.registered_bytes_budget = staged + staged / 8;
-        rdma.pool.arena_reclaim_after = Some(Duration::from_secs(60));
-        let velo = builder
-            .add_ucx_transport(ucx)
-            .rdma_config(rdma)
-            .build()
-            .await?;
-        return Ok((velo, true));
+#[cfg(feature = "ucx")]
+async fn rdma_velo(args: &Args, metrics: Arc<VeloMetrics>) -> anyhow::Result<Velo> {
+    use velo::RdmaConfig;
+    use velo::transports::ucx::UcxTransportBuilder;
+
+    let ucx = Arc::new(UcxTransportBuilder::new().build()?);
+    let staged = (args.stage_gib * f64::from(1u32 << 30)) as u64;
+    let mut rdma = RdmaConfig::default();
+    // A file is staged by copying it into registered memory. Pooled arenas are
+    // registered once and reused; velo would give every file of 64 MiB or more an
+    // arena of its own, registered for it and unmapped only by a later sweep, which
+    // makes staging slow and soon spends the budget, past which it stages over TCP.
+    rdma.pool.dedicated_arena_min = u64::MAX;
+    // What transfer.rs stages at once, and the pool's rounding up of it (< 12.5%).
+    rdma.pool.registered_bytes_budget = staged + staged / 8;
+    rdma.pool.arena_reclaim_after = Some(Duration::from_secs(60));
+    tcp_velo(args, metrics)?
+        .add_ucx_transport(ucx)
+        .rdma_config(rdma)
+        .build()
+        .await
+}
+
+/// Velo, and whether it moves files over RDMA: unless `--no-rdma`, it does when it can.
+async fn build_velo(
+    args: &Args,
+    metrics: Arc<VeloMetrics>,
+    degraded: &Degraded,
+) -> anyhow::Result<(Velo, bool)> {
+    if !args.no_rdma {
+        #[cfg(feature = "ucx")]
+        match rdma_velo(args, Arc::clone(&metrics)).await {
+            Ok(velo) => return Ok((velo, true)),
+            Err(e) => degraded.report(
+                "RDMA",
+                format!("{e:#}: files move between machines over TCP, several times slower"),
+            ),
+        }
+        #[cfg(not(feature = "ucx"))]
+        degraded.report(
+            "RDMA",
+            "this rview-fs is built without it (--features ucx): files move between machines \
+             over TCP, several times slower"
+                .into(),
+        );
     }
-    Ok((builder.build().await?, false))
+    Ok((tcp_velo(args, metrics)?.build().await?, false))
+}
+
+/// Whether the kernel passes files through, tried once the mount answers: no request is
+/// answered before the kernel takes the reply to INIT, which is when it grants it.
+async fn probe_passthrough(mount: PathBuf, passthrough: Arc<Passthrough>) {
+    let up = tokio::task::spawn_blocking(move || std::fs::metadata(&mount));
+    match tokio::time::timeout(Duration::from_secs(30), up).await {
+        Ok(Ok(Ok(_))) => passthrough.probe(),
+        failed => tracing::error!(?failed, "the mount did not answer: passthrough is untried"),
+    }
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
@@ -136,8 +210,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let me = NodeId::parse(&node).with_context(|| format!("node id {node:?}"))?;
     let subject = args.subject.clone();
     std::fs::create_dir_all(&args.export)?;
+    // No fallback: fractal-fuse serves a mount over io_uring or not at all.
+    if let Err(e) = turn_on_fuse_over_io_uring() {
+        tracing::error!("rview-fs cannot mount: {e:#}");
+        return Err(e);
+    }
+    let degraded = Arc::new(Degraded::default());
     let registry = Registry::new();
-    let (velo, pinned) = build_velo(&args, Arc::new(VeloMetrics::register(&registry)?)).await?;
+    let metrics = Arc::new(VeloMetrics::register(&registry)?);
+    let (velo, pinned) = build_velo(&args, metrics, &degraded).await?;
     let state = Arc::new(State {
         me,
         export: args.export.clone(),
@@ -145,6 +226,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         nodes: RwLock::default(),
         cache: ContentCache::new((args.cache_gib * f64::from(1u32 << 30)) as u64),
         velo: velo.clone(),
+        rdma: pinned,
+        degraded: Arc::clone(&degraded),
     });
     let nats = async_nats::connect(&args.nats)
         .await
@@ -169,7 +252,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
         cancel.clone(),
     ));
     tasks.spawn(sync::rescan(Arc::clone(&state), cancel.clone()));
-    tasks.spawn(log_transfer_paths(registry, cancel.clone()));
+    tasks.spawn(log_transfer_paths(
+        registry,
+        pinned,
+        Arc::clone(&degraded),
+        cancel.clone(),
+    ));
+    let reminding = Arc::clone(&degraded);
+    let stop_reminding = cancel.clone();
+    tasks.spawn(async move { reminding.remind(stop_reminding).await });
     tasks.spawn(sync::watch_files(files, Arc::clone(&state), cancel.clone()));
     tasks.spawn(sync::watch_nodes(
         nats,
@@ -183,7 +274,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .fs_name("rview-fs")
         .read_only(true)
         .allow_other(true)
-        .default_permissions(true);
+        .default_permissions(true)
+        .passthrough(!args.no_passthrough);
     let (mount, workers, depth) = (args.mount.clone(), args.fuse_workers, args.fuse_queue_depth);
     let session = tokio::task::spawn_blocking(move || {
         // An rview-fs that died left its mount behind, which answers nothing.
@@ -196,7 +288,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
     })
     .await?
     .with_context(|| format!("mounting {}", args.mount.display()))?;
-    let fs = RviewFs::new(Arc::clone(&state), tokio::runtime::Handle::current());
+    let passthrough = (!args.no_passthrough)
+        .then(|| Arc::new(Passthrough::new(session.fuse_fd(), Arc::clone(&degraded))));
+    let fs = RviewFs::new(
+        Arc::clone(&state),
+        tokio::runtime::Handle::current(),
+        passthrough.clone(),
+    );
     let (ended_tx, ended) = tokio::sync::oneshot::channel();
     let fuse = std::thread::Builder::new()
         .name("rview-fuse".into())
@@ -205,6 +303,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let _ = ended_tx.send(session.run(fs));
         })?;
     tracing::info!(mount = %args.mount.display(), node = state.me.as_str(), %subject, "mounted");
+    if let Some(passthrough) = passthrough {
+        tokio::spawn(probe_passthrough(args.mount.clone(), passthrough));
+    }
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let outcome = tokio::select! {
@@ -246,8 +347,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
 }
 
 /// How files moved between machines, RDMA or chunks over TCP, and why: logged when it
-/// changes. A transfer that works says nothing about the path it took.
-async fn log_transfer_paths(registry: Registry, cancel: CancellationToken) -> anyhow::Result<()> {
+/// changes, as an error when `rdma` is on and files moved over TCP all the same. A
+/// transfer that works says nothing about the path it took.
+async fn log_transfer_paths(
+    registry: Registry,
+    rdma: bool,
+    degraded: Arc<Degraded>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let mut last = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     loop {
@@ -268,6 +375,13 @@ async fn log_transfer_paths(registry: Registry, cancel: CancellationToken) -> an
             .filter(|(_, count)| *count > 0)
             .collect();
         if paths != last {
+            let fallbacks = health::tcp_fallbacks(&paths);
+            if rdma && !fallbacks.is_empty() {
+                degraded.report(
+                    "RDMA for every file",
+                    format!("files moved over TCP although RDMA is on, by why: {fallbacks:?}"),
+                );
+            }
             tracing::info!(?paths, "file transfers by path");
             last = paths;
         }

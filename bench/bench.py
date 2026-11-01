@@ -5,7 +5,9 @@ announced on NATS, then read through the first machine's mount: its own files, a
 other machine's, which rview-fs fetches over TCP (or RDMA, with --rdma).
 
 Every stage reports ops, ops/s, GB/s, and latency percentiles in milliseconds. The page
-cache of a file is dropped (posix_fadvise) where a stage reads cold.
+cache of a file is dropped (posix_fadvise) where a stage reads cold. At the end, every
+file read through the mounts is checked against the export it came from, and what
+rview-fs logged as a warning or an error is printed.
 
 Needs a built rview-fs, nats-server, and FUSE (/dev/fuse, fusermount3). Python 3.10+,
 standard library only. From the repository root:
@@ -137,11 +139,24 @@ class Node:
             self.proc.wait(timeout=30)
             raise RuntimeError(f"{self.name}: rview-fs did not stop in 30s of SIGTERM; killed it") from e
 
+    def logged(self) -> list[str]:
+        return re.sub(r"\x1b\[[0-9;]*m", "", self.log_path.read_text()).splitlines()
+
     def transfers(self) -> str:
         """How rview-fs moved the files it served, from its log: rdma/ok, or why not."""
-        log = re.sub(r"\x1b\[[0-9;]*m", "", self.log_path.read_text())
-        lines = [line for line in log.splitlines() if "file transfers by path" in line]
+        lines = [line for line in self.logged() if "file transfers by path" in line]
         return lines[-1].split("paths=")[-1] if lines else "none"
+
+    def passthrough(self) -> str:
+        if any("passthrough is on" in line for line in self.logged()):
+            return "on"
+        off = [line for line in self.logged() if "passthrough is off" in line]
+        return f"off ({off[0].split(' e=', 1)[-1]})" if off else "not tried"
+
+    def warnings(self) -> list[str]:
+        """What rview-fs logged as a warning or an error, each once."""
+        said = {line.split(": ", 1)[-1] for line in self.logged() if " WARN " in line or " ERROR " in line}
+        return sorted(said)
 
 
 @dataclass
@@ -280,16 +295,18 @@ def map_populated(stage: Stage, paths: list[Path]) -> None:
 
 
 def first_touches(stage: Stage, paths: list[Path], count: int) -> None:
-    """Map each file, nothing read in, and touch ``count`` random pages of it."""
+    """Map each file, nothing read in, and touch ``count`` random pages of it. The first
+    touch counts the open and the mapping too: either may fetch the file."""
     rng = random.Random(1)
     for path in paths:
+        begin = time.perf_counter()
         with open(path, "rb") as f:
             mapped = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ)
         pages = len(mapped) // mmap.PAGESIZE
         for page in rng.sample(range(pages), min(count, pages)):
-            begin = time.perf_counter()
             mapped[page * mmap.PAGESIZE]
             stage.add(time.perf_counter() - begin, mmap.PAGESIZE)
+            begin = time.perf_counter()
         mapped.close()
 
 
@@ -319,7 +336,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--rview-fs", default="target/release/rview-fs", help="the binary")
     parser.add_argument("--nats-server", default=shutil.which("nats-server"), help="the binary")
-    parser.add_argument("--rdma", action="store_true", help="run rview-fs with --rdma (a --features ucx build)")
+    parser.add_argument("--rdma", action="store_true", help="move files between the machines over RDMA, not TCP")
     parser.add_argument("--rview-fs-args", default="", help="more arguments for both rview-fs, as one string")
     parser.add_argument("--file-mib", type=int, default=64, help="size of the big files")
     parser.add_argument("--files", type=int, default=8, help="big files in each set")
@@ -341,7 +358,7 @@ def main() -> None:
     nats = Nats(args.nats_server)
     nodes: list[Node] = []
     try:
-        extra = (["--rdma"] if args.rdma else []) + args.rview_fs_args.split()
+        extra = ([] if args.rdma else ["--no-rdma"]) + args.rview_fs_args.split()
         nodes += [Node(work, "a", nats, args.rview_fs, extra), Node(work, "b", nats, args.rview_fs, extra)]
         a, b = nodes
         for node, other in ((a, b), (b, a)):  # until each knows the other, it shows none of its files
@@ -351,15 +368,17 @@ def main() -> None:
         def big(prefix: str, count: int) -> list[str]:
             return [f"{prefix}/{i:03}.bin" for i in range(count)]
 
-        own, fetched, mapped, touched = (big(p, args.files) for p in ("own", "fetched", "mapped", "touched"))
+        own, opened, fetched, mapped, touched = (
+            big(p, args.files) for p in ("own", "opened", "fetched", "mapped", "touched"))
         together = big("together", 2 * args.threads)
         small = [f"small/{i:05}.bin" for i in range(args.small)]
         write_files(a, nats, [(p, size) for p in own])
-        write_files(b, nats, [(p, size) for p in (*fetched, *mapped, *touched, *together)] +
+        write_files(b, nats, [(p, size) for p in (*opened, *fetched, *mapped, *touched, *together)] +
                     [(p, 4096) for p in small])
-        for node, last in ((a, own[-1]), (a, small[-1]), (a, together[-1])):
+        for node, last in ((a, own[-1]), (a, small[-1]), (a, together[-1]), (a, opened[-1])):
             wait_until((node.mount / last).exists, 60, f"{node.name} to show {last}")
-        drop_cached([a.export / p for p in own] + [b.export / p for p in (*fetched, *mapped, *touched, *together)],
+        drop_cached([a.export / p for p in own] +
+                    [b.export / p for p in (*opened, *fetched, *mapped, *touched, *together)],
                     written=True)
 
         def at(node: Node, paths: list[str], *, export: bool = False) -> list[Path]:
@@ -393,7 +412,8 @@ def main() -> None:
         # Opens: of another machine's file, it is staged there.
         opens(stage("open, local disk, not rview-fs"), native)
         opens(stage("open, this machine's file"), local)
-        opens(stage(f"open, another machine's {args.file_mib} MiB file, not read yet"), remote)
+        # Passed through, opening another machine's file fetches it.
+        opens(stage(f"open, another machine's {args.file_mib} MiB file, not read yet"), at(a, opened))
 
         # Whole files, 1 MiB reads, one file at a time.
         sequential(stage("read, local disk, not rview-fs, cold"), native)
@@ -401,7 +421,6 @@ def main() -> None:
         drop_cached(native)
         sequential(stage("read, this machine's file, cold"), local)
         sequential(stage("read, this machine's file, cached"), local)
-        drop_cached([b.export / p for p in fetched])  # staging them for the opens read them there
         whole = stage("read, another machine's file, fetched")
         sequential(whole, remote, stage("read, another machine's file, first MiB (fetches the file)"))
         sequential(stage("read, another machine's file, cached"), remote)
@@ -454,6 +473,10 @@ def main() -> None:
                 subprocess.run(["fusermount3", "-u", "-z", str(node.mount)], check=False, timeout=30)
         nats.close()
         transfers = {node.name: node.transfers() for node in nodes}
+        passthrough = {node.name: node.passthrough() for node in nodes}
+        for node in nodes:
+            for line in node.warnings()[:10]:
+                print(f"{node.name} warned: {line}")
         if any(mounted(node.mount) for node in nodes):
             print(f"left {work} in place: something is still mounted in it")
         else:
@@ -463,7 +486,8 @@ def main() -> None:
 
     config = (f"{args.files} files of {args.file_mib} MiB per set, {args.small} small files of 4 KiB, "
               f"{args.threads} readers at once; files between the machines over "
-              + (f"RDMA (transfers by path: {transfers})" if args.rdma else "TCP"))
+              + (f"RDMA (transfers by path: {transfers})" if args.rdma else "TCP")
+              + f"; passthrough {passthrough}")
     print(config)
     print(table(stages))
     if args.json:

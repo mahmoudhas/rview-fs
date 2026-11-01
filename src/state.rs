@@ -1,13 +1,15 @@
 //! What the FUSE file system and the NATS tasks share.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::anyhow;
-use bytes::Bytes;
 use parking_lot::RwLock;
 use velo::Velo;
 
 use crate::cache::{ContentCache, Key};
+use crate::content::Content;
+use crate::health::Degraded;
 use crate::index::{Index, NodeId};
 use crate::sync::Nodes;
 use crate::transfer::{self, Staged};
@@ -19,8 +21,11 @@ pub struct State {
     // holds it for one lookup or one batch of updates, and never across an await.
     pub index: RwLock<Index>,
     pub nodes: RwLock<Nodes>,
-    pub cache: ContentCache,
+    pub cache: ContentCache<Content>,
     pub velo: Velo,
+    /// Files move between nodes over RDMA.
+    pub rdma: bool,
+    pub degraded: Arc<Degraded>,
 }
 
 impl State {
@@ -45,9 +50,13 @@ impl State {
         transfer::unstage(&self.velo, instance, staged).await
     }
 
-    /// The bytes of a file another node holds, in memory once read. `staged` is a stage
-    /// taken for it already, when the file was opened.
-    pub async fn remote_bytes(&self, key: &Key, staged: Option<Staged>) -> anyhow::Result<Bytes> {
+    /// A file another node holds, fetched into memory. `staged` is a stage taken for it
+    /// already, when the file was opened.
+    pub async fn remote_content(
+        &self,
+        key: &Key,
+        staged: Option<Staged>,
+    ) -> anyhow::Result<Content> {
         self.cache
             .get_or_fetch(key, || async {
                 let staged = match staged {
@@ -56,8 +65,20 @@ impl State {
                         anyhow!("node {} no longer has {}", key.node.as_str(), key.path)
                     })?,
                 };
-                transfer::fetch(&self.velo, staged).await
+                transfer::fetch(&self.velo, staged, key.path.as_str()).await
             })
             .await
+            .inspect_err(|e| {
+                if self.rdma && e.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) {
+                    self.degraded.report(
+                        "working RDMA",
+                        format!(
+                            "{e:#}: a transfer never completed, which is often UCX on the wrong \
+                             device: set UCX_NET_DEVICES to one port (mlx5_0:1, for one), or run \
+                             with --no-rdma"
+                        ),
+                    );
+                }
+            })
     }
 }

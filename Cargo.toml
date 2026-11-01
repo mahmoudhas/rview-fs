@@ -8,8 +8,9 @@ description = "A read-only FUSE union of the directories a group of machines exp
 
 
 [features]
-default = []
-# Files of other machines over RDMA (UCX). Building needs libibverbs-dev and librdmacm-dev.
+default = ["ucx"]
+# Files of other machines over RDMA (UCX), on by default. Building needs libibverbs-dev
+# and librdmacm-dev; --no-default-features builds without.
 ucx = ["velo/ucx"]
 
 [dependencies]

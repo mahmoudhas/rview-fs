@@ -8,8 +8,11 @@
 //! other, listing a machine when it shows up. README.md has the protocol.
 
 pub mod cache;
+pub mod content;
 pub mod fs;
+pub mod health;
 pub mod index;
+pub mod passthrough;
 pub mod path;
 pub mod state;
 pub mod sync;

@@ -11,19 +11,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: RDMA libraries
+        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev
       - name: Toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
-  rdma:
-    name: clippy with --features ucx
+  tcp-only:
+    name: clippy without RDMA
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: RDMA libraries
-        run: sudo apt-get update && sudo apt-get install -y libibverbs-dev librdmacm-dev
       - name: Toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - run: cargo clippy --locked --all-targets --features ucx -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings

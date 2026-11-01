@@ -1,7 +1,6 @@
-//! Files of other nodes, in host memory once read: fetched whole on the first read of
-//! any byte of them, by one reader while the others wait, and dropped least recently
-//! used first past a budget. Files never change once written, so a cached file is never
-//! stale.
+//! Files of other nodes, in host memory once fetched: whole, by one reader while the
+//! others wait, and dropped least recently used first past a budget. Files never change
+//! once written, so a cached file is never stale.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,8 +10,26 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 
+use crate::content::Content;
 use crate::index::NodeId;
 use crate::path::RelPath;
+
+/// What the cache holds, and the bytes of memory each takes.
+pub trait Weighed: Clone {
+    fn weight(&self) -> u64;
+}
+
+impl Weighed for Bytes {
+    fn weight(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
+impl Weighed for Content {
+    fn weight(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -20,34 +37,37 @@ pub struct Key {
     pub path: RelPath,
 }
 
-struct Slot {
-    bytes: Arc<OnceCell<Bytes>>,
+struct Slot<V> {
+    bytes: Arc<OnceCell<V>>,
     last_used: u64,
     counted: bool,
 }
 
-#[derive(Default)]
-struct Slots {
-    slots: HashMap<Key, Slot>,
+struct Slots<V> {
+    slots: HashMap<Key, Slot<V>>,
     clock: u64,
     bytes: u64,
 }
 
-pub struct ContentCache {
+pub struct ContentCache<V: Weighed> {
     budget: u64,
     // Every read takes it for a moment to find its file; never across an await.
-    slots: Mutex<Slots>,
+    slots: Mutex<Slots<V>>,
 }
 
-impl ContentCache {
+impl<V: Weighed> ContentCache<V> {
     pub fn new(budget: u64) -> Self {
         Self {
             budget,
-            slots: Mutex::default(),
+            slots: Mutex::new(Slots {
+                slots: HashMap::new(),
+                clock: 0,
+                bytes: 0,
+            }),
         }
     }
 
-    pub fn get(&self, key: &Key) -> Option<Bytes> {
+    pub fn get(&self, key: &Key) -> Option<V> {
         let mut s = self.slots.lock();
         s.clock += 1;
         let clock = s.clock;
@@ -58,10 +78,10 @@ impl ContentCache {
 
     /// The file's bytes, fetched with `fetch` unless they are here or on their way.
     /// A failed fetch is not kept: the next read tries again.
-    pub async fn get_or_fetch<F, Fut>(&self, key: &Key, fetch: F) -> anyhow::Result<Bytes>
+    pub async fn get_or_fetch<F, Fut>(&self, key: &Key, fetch: F) -> anyhow::Result<V>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = anyhow::Result<Bytes>>,
+        Fut: Future<Output = anyhow::Result<V>>,
     {
         let cell = {
             let mut s = self.slots.lock();
@@ -90,7 +110,7 @@ impl ContentCache {
 
     /// Drop the slot of a fetch that failed, unless another reader filled it since or it
     /// is another slot by now: an empty slot is never evicted.
-    fn forget_unfetched(&self, key: &Key, cell: &Arc<OnceCell<Bytes>>) {
+    fn forget_unfetched(&self, key: &Key, cell: &Arc<OnceCell<V>>) {
         let mut s = self.slots.lock();
         if let Some(slot) = s.slots.get(key)
             && Arc::ptr_eq(&slot.bytes, cell)
@@ -119,7 +139,7 @@ impl ContentCache {
         let Some(slot) = s.slots.get_mut(key) else {
             return;
         };
-        let Some(len) = slot.bytes.get().map(|b| b.len() as u64) else {
+        let Some(len) = slot.bytes.get().map(Weighed::weight) else {
             return;
         };
         if slot.counted {
@@ -138,7 +158,7 @@ impl ContentCache {
                 break;
             };
             if let Some(gone) = s.slots.remove(&victim) {
-                s.bytes -= gone.bytes.get().map_or(0, |b| b.len() as u64);
+                s.bytes -= gone.bytes.get().map_or(0, Weighed::weight);
             }
         }
     }

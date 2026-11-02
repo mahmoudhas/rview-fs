@@ -1,0 +1,144 @@
+//! The files of other nodes this node has open. The node a file is on holds it open from
+//! the open until this node closes it (held.rs), and this node lists the ones it has open
+//! to it every RENEW_EVERY, so that one it no longer has open is closed there even when
+//! its close never arrived.
+
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+
+use anyhow::anyhow;
+use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
+use velo::InstanceId;
+
+use crate::cache::Key;
+use crate::held::RENEW_EVERY;
+use crate::state::State;
+use crate::transfer::{self, Opened};
+
+/// The handles this node has open, by the node's rview-fs that holds them.
+#[derive(Default)]
+pub struct RemoteFiles {
+    // Taken for a moment by every open and close, and every RENEW_EVERY.
+    open: Mutex<HashMap<InstanceId, BTreeSet<u64>>>,
+}
+
+impl RemoteFiles {
+    fn add(&self, instance: InstanceId, handle: u64) {
+        self.open.lock().entry(instance).or_default().insert(handle);
+    }
+
+    fn remove(&self, instance: InstanceId, handle: u64) {
+        let mut open = self.open.lock();
+        if let Some(handles) = open.get_mut(&instance) {
+            handles.remove(&handle);
+            if handles.is_empty() {
+                open.remove(&instance);
+            }
+        }
+    }
+
+    /// The handles open on each node that holds some.
+    pub fn lists(&self) -> Vec<(InstanceId, Vec<u64>)> {
+        self.open
+            .lock()
+            .iter()
+            .map(|(instance, handles)| (*instance, handles.iter().copied().collect()))
+            .collect()
+    }
+}
+
+/// A file of another node, and the handle it holds it open for us by.
+#[derive(Clone, Debug)]
+pub struct Remote {
+    pub key: Key,
+    pub instance: InstanceId,
+    pub handle: u64,
+    pub size: u64,
+}
+
+/// A file another node holds open for this one, until this is dropped.
+pub struct RemoteFile {
+    pub remote: Remote,
+    state: Arc<State>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl RemoteFile {
+    /// Have the node `key` names open its file for us. None when it does not have it
+    /// (anymore).
+    pub async fn open(
+        state: Arc<State>,
+        key: Key,
+        runtime: tokio::runtime::Handle,
+    ) -> anyhow::Result<Option<Self>> {
+        let instance = state
+            .nodes
+            .read()
+            .instance(&key.node)
+            .ok_or_else(|| anyhow!("node {} is not up", key.node.as_str()))?;
+        let Some(Opened { handle, size }) =
+            transfer::open(&state.velo, instance, &key.path).await?
+        else {
+            return Ok(None);
+        };
+        state.remote.add(instance, handle);
+        Ok(Some(Self {
+            remote: Remote {
+                key,
+                instance,
+                handle,
+                size,
+            },
+            state,
+            runtime,
+        }))
+    }
+}
+
+impl Drop for RemoteFile {
+    fn drop(&mut self) {
+        let (instance, handle) = (self.remote.instance, self.remote.handle);
+        self.state.remote.remove(instance, handle);
+        let state = Arc::clone(&self.state);
+        // A close that never arrives is caught by the next list (held.rs).
+        self.runtime.spawn(async move {
+            if let Err(e) = transfer::close(&state.velo, instance, handle).await {
+                tracing::debug!(?instance, "closing a file another node holds failed: {e:#}");
+            }
+        });
+    }
+}
+
+/// List the files this node has open to each node that holds some, every RENEW_EVERY,
+/// until cancelled.
+pub async fn renew(state: Arc<State>, cancel: CancellationToken) -> anyhow::Result<()> {
+    let mut tick = tokio::time::interval(RENEW_EVERY);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            _ = tick.tick() => {}
+        }
+        let mut sent = tokio::task::JoinSet::new();
+        for (instance, open) in state.remote.lists() {
+            let velo = state.velo.clone();
+            sent.spawn(async move { (instance, transfer::renew(&velo, instance, open).await) });
+        }
+        while let Some(done) = sent.join_next().await {
+            match done {
+                Ok((_, Ok(()))) => {}
+                Ok((instance, Err(e))) => {
+                    tracing::warn!(
+                        ?instance,
+                        "listing the files we have open to a node failed: {e:#}"
+                    );
+                }
+                Err(e) => tracing::warn!(%e, "listing the files we have open to a node panicked"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "remote_test.rs"]
+mod tests;

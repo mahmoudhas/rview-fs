@@ -3,16 +3,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::anyhow;
+use bytes::Bytes;
 use parking_lot::RwLock;
 use velo::Velo;
 
-use crate::cache::{ContentCache, Key};
-use crate::content::Content;
+use crate::cache::ContentCache;
 use crate::health::Degraded;
 use crate::index::{Index, NodeId};
+use crate::remote::{Remote, RemoteFiles};
 use crate::sync::Nodes;
-use crate::transfer::{self, Staged};
+use crate::transfer;
 
 pub struct State {
     pub me: NodeId,
@@ -21,7 +21,10 @@ pub struct State {
     // holds it for one lookup or one batch of updates, and never across an await.
     pub index: RwLock<Index>,
     pub nodes: RwLock<Nodes>,
-    pub cache: ContentCache<Content>,
+    /// Files of other nodes, once read.
+    pub cache: ContentCache<Bytes>,
+    /// The files of other nodes this node has open.
+    pub remote: RemoteFiles,
     pub velo: Velo,
     /// Files move between nodes over RDMA.
     pub rdma: bool,
@@ -29,43 +32,12 @@ pub struct State {
 }
 
 impl State {
-    /// Ask the node `key` names to stage the file for us. None when it does not have
-    /// it anymore.
-    pub async fn stage(&self, key: &Key) -> anyhow::Result<Option<Staged>> {
-        let instance = self
-            .nodes
-            .read()
-            .instance(&key.node)
-            .ok_or_else(|| anyhow!("node {} is not up", key.node.as_str()))?;
-        transfer::stage(&self.velo, instance, &key.path).await
-    }
-
-    /// Tell the node `key` names we will not read the file it staged for us.
-    pub async fn unstage(&self, key: &Key, staged: Staged) -> anyhow::Result<()> {
-        let instance = self
-            .nodes
-            .read()
-            .instance(&key.node)
-            .ok_or_else(|| anyhow!("node {} is not up", key.node.as_str()))?;
-        transfer::unstage(&self.velo, instance, staged).await
-    }
-
-    /// A file another node holds, fetched into memory. `staged` is a stage taken for it
-    /// already, when the file was opened.
-    pub async fn remote_content(
-        &self,
-        key: &Key,
-        staged: Option<Staged>,
-    ) -> anyhow::Result<Content> {
+    /// A file another node holds open for us, fetched whole, or from the cache when it
+    /// was read before.
+    pub async fn remote_content(&self, remote: &Remote) -> anyhow::Result<Bytes> {
         self.cache
-            .get_or_fetch(key, || async {
-                let staged = match staged {
-                    Some(staged) => staged,
-                    None => self.stage(key).await?.ok_or_else(|| {
-                        anyhow!("node {} no longer has {}", key.node.as_str(), key.path)
-                    })?,
-                };
-                transfer::fetch(&self.velo, staged, key.path.as_str()).await
+            .get_or_fetch(&remote.key, || {
+                transfer::fetch(&self.velo, remote.instance, remote.handle)
             })
             .await
             .inspect_err(|e| {

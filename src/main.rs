@@ -1,6 +1,6 @@
 //! Mount the union of the directory each machine of a group exports, read-only, with
-//! files of other machines fetched into host memory. Run one on every machine of the
-//! group, with the same NATS subject.
+//! files of other machines read into host memory when first read. Run one on every
+//! machine of the group, with the same NATS subject.
 //!
 //! It runs on Linux 6.14: FUSE over io_uring, which it turns on, passthrough, and RDMA.
 //! Without passthrough or RDMA it goes on, slower, and says so loudly (health.rs).
@@ -18,10 +18,12 @@ use prometheus::Registry;
 use rview_fs::cache::ContentCache;
 use rview_fs::fs::RviewFs;
 use rview_fs::health::{self, Degraded};
+use rview_fs::held::Held;
 use rview_fs::index::{Index, NodeId};
 use rview_fs::passthrough::Passthrough;
+use rview_fs::remote::RemoteFiles;
 use rview_fs::state::State;
-use rview_fs::{sync, transfer};
+use rview_fs::{remote, sync, transfer};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -48,11 +50,11 @@ struct Args {
     /// `{subject}.nodes`.
     #[arg(long, env = "RVIEW_SUBJECT", default_value = "rview")]
     subject: String,
-    /// Host memory for the files of other machines, in GiB.
+    /// Host memory for the files of other machines read before, in GiB.
     #[arg(long, default_value_t = 16.0)]
     cache_gib: f64,
-    /// Host memory this machine stages its files in for the others to read, in GiB. Past
-    /// it, another machine cannot open a file of this one until stages are taken.
+    /// Host memory this machine stages its files in while other machines read them, in
+    /// GiB. Past it, another machine cannot read a file of this one until stages are taken.
     #[arg(long, default_value_t = 16.0)]
     stage_gib: f64,
     /// Serve every read itself, instead of having the kernel read files directly (FUSE
@@ -132,6 +134,43 @@ fn turn_on_fuse_over_io_uring() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The most files rview-fs holds open for other machines: half of its open-file limit,
+/// raised to the most it may be, and the other half for everything else.
+fn files_to_hold() -> anyhow::Result<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes the struct it is given, which lives for the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the open-file limit");
+    }
+    // Past fs.nr_open (2^20 by default) the kernel refuses any limit.
+    let most = limit.rlim_max.min(1 << 20);
+    if limit.rlim_cur < most {
+        let raised = libc::rlimit {
+            rlim_cur: most,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: setrlimit reads the struct it is given, which lives for the call.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            limit.rlim_cur = most;
+        } else {
+            tracing::warn!(
+                e = %std::io::Error::last_os_error(),
+                "raising the open-file limit failed"
+            );
+        }
+    }
+    let held = usize::try_from(limit.rlim_cur / 2).unwrap_or(usize::MAX);
+    tracing::info!(
+        open_files = limit.rlim_cur,
+        held,
+        "files held open for other machines at most"
+    );
+    Ok(held)
+}
+
 fn tcp_velo(args: &Args, metrics: Arc<VeloMetrics>) -> anyhow::Result<VeloBuilder> {
     let listener =
         std::net::TcpListener::bind(args.bind).with_context(|| format!("binding {}", args.bind))?;
@@ -151,8 +190,8 @@ async fn rdma_velo(args: &Args, metrics: Arc<VeloMetrics>) -> anyhow::Result<Vel
     let ucx = Arc::new(UcxTransportBuilder::new().build()?);
     let staged = (args.stage_gib * f64::from(1u32 << 30)) as u64;
     let mut rdma = RdmaConfig::default();
-    // A file is staged by copying it into registered memory. Pooled arenas are
-    // registered once and reused; velo would give every file of 64 MiB or more an
+    // A file being read is staged by copying it into registered memory. Pooled arenas
+    // are registered once and reused; velo would give every file of 64 MiB or more an
     // arena of its own, registered for it and unmapped only by a later sweep, which
     // makes staging slow and soon spends the budget, past which it stages over TCP.
     rdma.pool.dedicated_arena_min = u64::MAX;
@@ -215,6 +254,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tracing::error!("rview-fs cannot mount: {e:#}");
         return Err(e);
     }
+    let held = Arc::new(Held::new(files_to_hold()?));
     let degraded = Arc::new(Degraded::default());
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
@@ -225,6 +265,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         index: RwLock::new(Index::new()),
         nodes: RwLock::default(),
         cache: ContentCache::new((args.cache_gib * f64::from(1u32 << 30)) as u64),
+        remote: RemoteFiles::default(),
         velo: velo.clone(),
         rdma: pinned,
         degraded: Arc::clone(&degraded),
@@ -249,8 +290,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         args.export.clone(),
         pinned,
         stages,
+        held,
         cancel.clone(),
     ));
+    tasks.spawn(remote::renew(Arc::clone(&state), cancel.clone()));
     tasks.spawn(sync::rescan(Arc::clone(&state), cancel.clone()));
     tasks.spawn(log_transfer_paths(
         registry,

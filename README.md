@@ -1,8 +1,8 @@
 # rview-fs
 
 A read-only FUSE file system that shows every machine of a group the union of the
-directory each of them exports. A file another machine holds is fetched into host memory
-over RDMA, and never copied to a local disk.
+directory each of them exports. A file another machine holds is read into host memory
+over RDMA, whole, when it is first read, and never copied to a local disk.
 
 It suits files that machines write once and read many times, each machine writing its own
 and reading everyone's: no shared storage, no copying every file everywhere, and a
@@ -21,20 +21,38 @@ their files on [NATS](https://nats.io).
   rview-fs keeps an index of every machine's files from those announcements, and lists a
   machine's export when the machine shows up and every 10 minutes.
 - Opening a file of this machine hands the export's file to the kernel, which reads and
-  maps it with no request to rview-fs.
-- Opening a file of another machine has that machine stage it, which keeps the file even
-  if that machine deletes it meanwhile, and fetches all of it into a memfd: the open
-  returns once it is there. The kernel then reads and maps the memfd as it does a local
-  file. An open file keeps it until closed, and a mapped one until unmapped.
-- `--cache-gib` bounds the memory for other machines' files, which go least recently used
-  first; `--stage-gib` bounds what a machine stages for the others.
+  maps it with no request to rview-fs. All the opens of a file share one backing file,
+  the one the kernel allows a file at a time.
+- Opening a file of another machine has that machine open it too, and hold it open until
+  this one closes it: a file it deletes meanwhile is still read whole. Nothing moves when
+  the file is opened. The first read fetches all of it into host memory, a mapped file's
+  first page fault included, and rview-fs serves its reads from there; the kernel keeps
+  what it read. A file opened and never read is never fetched. An open file keeps its
+  bytes until closed, and a mapped one until unmapped, so a page the kernel drops is read
+  again without the other machine.
+- `--cache-gib` keeps other machines' files read before, which then open without asking
+  their machine, least recently used first out; `--stage-gib` bounds what a machine stages
+  for the others while they read its files.
+
+### Files open on another machine
+
+A machine holds a file open for another from the other's open to its close, as an
+`Arc<File>`: a read of it still going keeps it until done. Nothing the other fails to say
+leaves it open:
+
+- Every 10 s each machine lists the files it has open to each machine holding some. A file
+  not on the list is closed, unless it was opened within the last 120 s, when its open may
+  not have answered yet: a close that never arrived, or an open that gave up.
+- A machine silent for 60 s has all of its files closed.
+- rview-fs raises its open-file limit to the most it may (at most 2^20), and holds at most
+  half of it open for the others; an open past that fails, and says why.
 
 ## What it needs, and what happens without
 
 | | Needs | Without it |
 | --- | --- | --- |
 | FUSE over io_uring | Linux 6.14 built with `CONFIG_FUSE_IO_URING` | rview-fs does not start: fractal-fuse has no other way. rview-fs turns the kernel's switch on (`/sys/module/fuse/parameters/enable_uring`) when it is off |
-| Passthrough | Linux 6.9 built with `CONFIG_FUSE_PASSTHROUGH`, `CAP_SYS_ADMIN`, and the export on a plain file system: not overlayfs | rview-fs serves the reads itself, several times slower, and fetches a file of another machine on its first read rather than when it is opened |
+| Passthrough | Linux 6.9 built with `CONFIG_FUSE_PASSTHROUGH`, `CAP_SYS_ADMIN`, and the export on a plain file system: not overlayfs | rview-fs serves the reads of this machine's files itself, several times slower. It serves the files of other machines either way |
 | RDMA | A build with `--features ucx` (the default), rdma-core's libraries, and an RDMA NIC; on RoCE, the host's network namespace, and with several NICs, UCX on one port: `UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self` | Files move between machines over TCP |
 
 What is missing is logged as an error, `DEGRADED: ... is not available: <why>`, when
@@ -56,8 +74,8 @@ Whatever writes into an export follows three rules:
 - A machine that holds a file at some path holds the same bytes there as every other
   machine that holds one.
 
-Serving a file to another machine renews its modification time, so a cleanup that
-deletes the least recently used files keeps the ones other machines use.
+A file another machine opens has its modification time renewed, so a cleanup that deletes
+the least recently used files keeps the ones other machines use.
 
 ## NATS
 
@@ -87,11 +105,11 @@ UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self \
 | `--node-id` (`RVIEW_NODE_ID`) | The name this machine's files are announced under (host name) |
 | `--nats` (`RVIEW_NATS`) | The NATS server |
 | `--subject` (`RVIEW_SUBJECT`) | The subjects' prefix (`rview`) |
-| `--cache-gib` | Host memory for the files of other machines (16) |
-| `--stage-gib` | Host memory this machine stages its files in for the others (16); past it, they cannot open its files until stages are read or closed |
+| `--cache-gib` | Host memory for the files of other machines read before (16) |
+| `--stage-gib` | Host memory this machine stages its files in while the others read them (16); past it, they cannot read its files until stages are taken |
 | `--bind` | Where velo listens for the other machines (`0.0.0.0:0`) |
 | `--fuse-workers`, `--fuse-queue-depth` | Threads serving FUSE requests (8), and requests in flight per kernel queue (8) |
-| `--no-passthrough` | Serve every read itself |
+| `--no-passthrough` | Serve the reads of this machine's files too |
 | `--no-rdma` | Move files between machines over TCP |
 
 It needs root, or `CAP_SYS_ADMIN`, `/dev/fuse` and `fusermount3`. On SIGTERM it detaches

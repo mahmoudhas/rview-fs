@@ -1,4 +1,4 @@
-//! Files of other nodes, in host memory once fetched: whole, by one reader while the
+//! Files of other nodes, in host memory once read: fetched whole, by one reader while the
 //! others wait, and dropped least recently used first past a budget. Files never change
 //! once written, so a cached file is never stale.
 
@@ -10,7 +10,6 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 
-use crate::content::Content;
 use crate::index::NodeId;
 use crate::path::RelPath;
 
@@ -22,12 +21,6 @@ pub trait Weighed: Clone {
 impl Weighed for Bytes {
     fn weight(&self) -> u64 {
         self.len() as u64
-    }
-}
-
-impl Weighed for Content {
-    fn weight(&self) -> u64 {
-        self.bytes.len() as u64
     }
 }
 

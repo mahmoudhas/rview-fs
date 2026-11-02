@@ -1,11 +1,11 @@
 //! Moving files between the machines with velo.
 //!
-//! Each node serves its own export: a listing of its files, and a file staged for one
-//! reader. Staged in RDMA-registered memory (with the `ucx` feature and `--rdma`),
-//! the reader's NIC reads it straight into the reader's host memory; otherwise it is
+//! Each node serves its own export to the others: a listing of its files; a file held
+//! open for one of them from its open until its close (held.rs); and such a file's bytes,
+//! staged when it reads them. Staged in RDMA-registered memory (with the `ucx` feature),
+//! the reader's NIC reads them straight into the reader's host memory; otherwise they are
 //! pulled in chunks over TCP. The bytes staged at once are bounded; a stage is gone once
-//! its reader took it, released when the reader closes the file without reading, and
-//! dropped after a while if neither happens.
+//! its reader took it, and dropped after a while if it never does.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -21,16 +21,20 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use velo::{DataHandle, Handler, InstanceId, TypedContext, Velo, WeakVelo};
 
-use crate::content::{self, Content};
+use crate::content;
+use crate::held::Held;
 use crate::path::RelPath;
 
 pub const LIST: &str = "rview_list";
-pub const STAGE: &str = "rview_stage";
-pub const UNSTAGE: &str = "rview_unstage";
-const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub const OPEN: &str = "rview_open";
+pub const FETCH: &str = "rview_fetch";
+pub const CLOSE: &str = "rview_close";
+pub const RENEW: &str = "rview_renew";
+/// How long a call waits for its answer: less than held::GRACE.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 // A stage nobody took by then is dropped; no transfer takes anywhere near as long.
 const STAGED_FOR: Duration = Duration::from_secs(600);
-const REAP_EVERY: Duration = Duration::from_secs(60);
+const REAP_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Listing {
@@ -50,19 +54,34 @@ pub struct Listed {
 struct ListRequest {}
 
 #[derive(Debug, Serialize, Deserialize)]
-struct StageRequest {
+struct OpenRequest {
+    client: InstanceId,
     path: String,
 }
 
+/// A file a node holds open for another, and the handle it does by.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Opened {
+    pub handle: u64,
+    pub size: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-struct UnstageRequest {
-    handle: DataHandle,
+struct HandleRequest {
+    client: InstanceId,
+    handle: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RenewRequest {
+    client: InstanceId,
+    open: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct Staged {
-    pub handle: DataHandle,
-    pub size: u64,
+struct Staged {
+    handle: DataHandle,
+    size: u64,
 }
 
 pub fn now() -> f64 {
@@ -109,26 +128,38 @@ pub fn scan(root: &Path) -> io::Result<Listing> {
     Ok(Listing { files, listed_at })
 }
 
-/// The bytes of a file, mapped, or None when it is not there. Reading it counts as using
-/// it: its time is renewed, which a cleanup that deletes the least recently used files
-/// can go by. Blocks.
-fn map_file(path: &Path) -> io::Result<Option<Bytes>> {
+/// The file of the export at `path`, open, and its size; None when it is not there.
+/// Opening it for another node counts as using it: its time is renewed, which a cleanup
+/// that deletes the least recently used files can go by. Blocks.
+pub fn open_export_file(path: &Path) -> io::Result<Option<(File, u64)>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    if let Err(e) = file.set_modified(SystemTime::now()) {
-        tracing::debug!(?path, %e, "could not mark a staged file as used");
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a file",
+            path.display()
+        )));
     }
+    if let Err(e) = file.set_modified(SystemTime::now()) {
+        tracing::debug!(?path, %e, "could not mark a file another node opened as used");
+    }
+    Ok(Some((file, meta.len())))
+}
+
+/// The bytes of a held file, mapped. Blocks.
+fn map_held(file: &File) -> io::Result<Bytes> {
     if file.metadata()?.len() == 0 {
-        return Ok(Some(Bytes::new()));
+        return Ok(Bytes::new());
     }
     // SAFETY: files are written under a hidden name and moved into place whole, and never
-    // written again (README.md), so the mapping never changes under us. A file deleted
-    // meanwhile stays mapped until the mapping is dropped.
-    let mapped = unsafe { memmap2::Mmap::map(&file)? };
-    Ok(Some(Bytes::from_owner(mapped)))
+    // written again (README.md), so the mapping never changes under us. It keeps the file
+    // after the file is closed and deleted, until the mapping is dropped.
+    let mapped = unsafe { memmap2::Mmap::map(file)? };
+    Ok(Bytes::from_owner(mapped))
 }
 
 /// What this node staged for other nodes: within `budget` bytes, oldest first.
@@ -171,16 +202,6 @@ impl Stages {
             .push_back((Instant::now(), handle, size));
     }
 
-    /// Release a stage nobody will take.
-    fn release(&self, handle: DataHandle, store: &velo::rendezvous::store::DataStore) {
-        let mut s = self.staged.lock();
-        if let Some(i) = s.stages.iter().position(|(_, h, _)| *h == handle) {
-            let (_, _, size) = s.stages.remove(i).expect("the position is in range");
-            s.bytes -= size;
-            store.remove(handle.unpack().1);
-        }
-    }
-
     /// Drop the stages not taken in time, and count those taken.
     fn reap(&self, store: &velo::rendezvous::store::DataStore) {
         let mut s = self.staged.lock();
@@ -216,13 +237,14 @@ impl StageList {
     }
 }
 
-/// Serve this node's export at `root` to the other nodes until cancelled. With
-/// `pinned`, files are staged in RDMA-registered memory.
+/// Serve this node's export at `root` to the other nodes until cancelled. With `pinned`,
+/// files are staged in RDMA-registered memory.
 pub async fn serve(
     velo: Velo,
     root: PathBuf,
     pinned: bool,
     stages: Arc<Stages>,
+    held: Arc<Held<InstanceId>>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let list_root = root.clone();
@@ -236,25 +258,53 @@ pub async fn serve(
         })
         .build(),
     )?;
-    let weak: WeakVelo = velo.downgrade();
-    let staged_by = Arc::clone(&stages);
+    let opened_by = Arc::clone(&held);
     velo.register_handler(
-        Handler::typed_unary_async(STAGE, move |ctx: TypedContext<StageRequest>| {
-            let (weak, root, stages) = (weak.clone(), root.clone(), Arc::clone(&staged_by));
+        Handler::typed_unary_async(OPEN, move |ctx: TypedContext<OpenRequest>| {
+            let (root, held) = (root.clone(), Arc::clone(&opened_by));
             async move {
                 let path = RelPath::parse(&ctx.input.path)
                     .ok_or_else(|| anyhow!("not a path in the export: {:?}", ctx.input.path))?;
                 let file = root.join(path.as_str());
-                let Some(bytes) = tokio::task::spawn_blocking(move || map_file(&file)).await??
+                let Some((file, size)) =
+                    tokio::task::spawn_blocking(move || open_export_file(&file)).await??
                 else {
                     return Ok(None);
                 };
+                match held.open(ctx.input.client, file, Instant::now()) {
+                    Ok(handle) => Ok(Some(Opened { handle, size })),
+                    Err(_refused) => Err(anyhow!(
+                        "{} files are held open for other nodes already, the most this node holds",
+                        held.count()
+                    )),
+                }
+            }
+        })
+        .build(),
+    )?;
+    let (weak, fetched_from, staged_by): (WeakVelo, _, _) =
+        (velo.downgrade(), Arc::clone(&held), Arc::clone(&stages));
+    velo.register_handler(
+        Handler::typed_unary_async(FETCH, move |ctx: TypedContext<HandleRequest>| {
+            let (weak, held, stages) = (
+                weak.clone(),
+                Arc::clone(&fetched_from),
+                Arc::clone(&staged_by),
+            );
+            async move {
+                let HandleRequest { client, handle } = ctx.input;
+                let file = held.get(client, handle, Instant::now()).ok_or_else(|| {
+                    anyhow!(
+                        "no file {handle} is open for that node: closed, or this node restarted"
+                    )
+                })?;
+                let bytes = tokio::task::spawn_blocking(move || map_held(&file)).await??;
                 let velo = weak.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
                 let size = bytes.len() as u64;
                 let store = velo.rendezvous_manager().data_store();
                 anyhow::ensure!(
                     stages.reserve(size, store),
-                    "no room to stage {path} ({size} bytes): {} staged",
+                    "no room to stage {size} bytes: {} staged",
                     stages.bytes()
                 );
                 let handle = if pinned {
@@ -263,18 +313,36 @@ pub async fn serve(
                     velo.register_data(bytes)
                 };
                 stages.add(handle, size);
-                Ok(Some(Staged { handle, size }))
+                Ok(Staged { handle, size })
             }
         })
         .build(),
     )?;
-    let (weak, released_by) = (velo.downgrade(), Arc::clone(&stages));
+    let closed_by = Arc::clone(&held);
     velo.register_handler(
-        Handler::typed_unary_async(UNSTAGE, move |ctx: TypedContext<UnstageRequest>| {
-            let (weak, stages) = (weak.clone(), Arc::clone(&released_by));
+        Handler::typed_unary_async(CLOSE, move |ctx: TypedContext<HandleRequest>| {
+            let held = Arc::clone(&closed_by);
             async move {
-                let velo = weak.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
-                stages.release(ctx.input.handle, velo.rendezvous_manager().data_store());
+                held.close(ctx.input.client, ctx.input.handle);
+                Ok(())
+            }
+        })
+        .build(),
+    )?;
+    let renewed_by = Arc::clone(&held);
+    velo.register_handler(
+        Handler::typed_unary_async(RENEW, move |ctx: TypedContext<RenewRequest>| {
+            let held = Arc::clone(&renewed_by);
+            async move {
+                let RenewRequest { client, open } = ctx.input;
+                let closed = held.renew(client, &open, Instant::now());
+                if closed > 0 {
+                    tracing::warn!(
+                        ?client,
+                        closed,
+                        "closed files a node no longer has open: their closes never arrived"
+                    );
+                }
                 Ok(())
             }
         })
@@ -287,6 +355,10 @@ pub async fn serve(
             _ = tick.tick() => {}
         }
         stages.reap(velo.rendezvous_manager().data_store());
+        let closed = held.expire(Instant::now());
+        if closed > 0 {
+            tracing::warn!(closed, "closed the files of nodes gone silent");
+        }
     }
 }
 
@@ -300,48 +372,77 @@ pub async fn list(velo: &Velo, instance: InstanceId) -> anyhow::Result<Listing> 
         .context("listing a peer's files")
 }
 
-/// Ask the node to stage a file for us. None when it does not have it (anymore).
-pub async fn stage(
+/// Have the node open a file of its export, and hold it open for us until we close it.
+/// None when it does not have it (anymore).
+pub async fn open(
     velo: &Velo,
     instance: InstanceId,
     path: &RelPath,
-) -> anyhow::Result<Option<Staged>> {
-    velo.typed_unary::<Option<Staged>>(STAGE)?
-        .payload(&StageRequest {
+) -> anyhow::Result<Option<Opened>> {
+    velo.typed_unary::<Option<Opened>>(OPEN)?
+        .payload(&OpenRequest {
+            client: velo.instance_id(),
             path: path.as_str().to_owned(),
         })?
         .instance(instance)
         .timeout(CALL_TIMEOUT)
         .send()
         .await
-        .with_context(|| format!("staging {path}"))
+        .with_context(|| format!("opening {path}"))
 }
 
-/// Tell the node we will not read a file it staged for us.
-pub async fn unstage(velo: &Velo, instance: InstanceId, staged: Staged) -> anyhow::Result<()> {
-    velo.typed_unary::<()>(UNSTAGE)?
-        .payload(&UnstageRequest {
-            handle: staged.handle,
+/// The bytes of a file the node holds open for us as `handle`.
+pub async fn fetch(velo: &Velo, instance: InstanceId, handle: u64) -> anyhow::Result<Bytes> {
+    let staged = velo
+        .typed_unary::<Staged>(FETCH)?
+        .payload(&HandleRequest {
+            client: velo.instance_id(),
+            handle,
         })?
         .instance(instance)
         .timeout(CALL_TIMEOUT)
         .send()
         .await
-        .context("releasing a stage")
-}
-
-/// Read a staged file into a new memfd named `name`.
-pub async fn fetch(velo: &Velo, staged: Staged, name: &str) -> anyhow::Result<Content> {
-    let (file, mut map) = content::memfd(name, staged.size).context("making a memfd")?;
+        .context("staging an open file")?;
+    let mut map = content::buffer(staged.size).context("making room for a file")?;
     let mut dest: &mut [u8] = map.as_deref_mut().unwrap_or_default();
-    // A node that hangs rather than goes would hold the open or the read, and the page
-    // fault behind it, forever.
+    // A node that hangs rather than goes would hold the read, and the page fault behind
+    // it, forever.
     let lease = tokio::time::timeout(CALL_TIMEOUT, velo.get_into(staged.handle, &mut dest))
         .await
         .with_context(|| format!("no reply in {CALL_TIMEOUT:?} reading a staged file"))?
         .context("reading a staged file")?;
     velo.release(staged.handle, lease).await?;
-    Ok(Content::new(file, map)?)
+    Ok(content::freeze(map)?)
+}
+
+/// Tell the node we closed the file it holds open for us as `handle`.
+pub async fn close(velo: &Velo, instance: InstanceId, handle: u64) -> anyhow::Result<()> {
+    velo.typed_unary::<()>(CLOSE)?
+        .payload(&HandleRequest {
+            client: velo.instance_id(),
+            handle,
+        })?
+        .instance(instance)
+        .timeout(CALL_TIMEOUT)
+        .send()
+        .await
+        .context("closing a file another node holds")
+}
+
+/// Tell the node which of the files it holds open for us we still have open: all.
+pub async fn renew(velo: &Velo, instance: InstanceId, open: Vec<u64>) -> anyhow::Result<()> {
+    velo.typed_unary::<()>(RENEW)?
+        .payload(&RenewRequest {
+            client: velo.instance_id(),
+            open,
+        })?
+        .instance(instance)
+        // A list late by this much is overtaken by the next.
+        .timeout(crate::held::RENEW_EVERY)
+        .send()
+        .await
+        .context("listing the files we have open")
 }
 
 #[cfg(test)]

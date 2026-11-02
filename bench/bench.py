@@ -2,7 +2,8 @@
 """Benchmark of rview-fs on one host, which plays two machines: two rview-fs, each with
 its own export and mount, and a NATS server. Files are written into the exports and
 announced on NATS, then read through the first machine's mount: its own files, and the
-other machine's, which rview-fs fetches over TCP (or RDMA, with --rdma).
+other machine's, which rview-fs fetches over TCP (or RDMA, with --rdma) when they are
+first read.
 
 Every stage reports ops, ops/s, GB/s, and latency percentiles in milliseconds. The page
 cache of a file is dropped (posix_fadvise) where a stage reads cold. At the end, every
@@ -409,10 +410,9 @@ def main() -> None:
             os.listdir(a.mount / "small")
             listing.add(time.perf_counter() - begin)
 
-        # Opens: of another machine's file, it is staged there.
         opens(stage("open, local disk, not rview-fs"), native)
         opens(stage("open, this machine's file"), local)
-        # Passed through, opening another machine's file fetches it.
+        # Another machine's file is opened there too, and held open; nothing moves yet.
         opens(stage(f"open, another machine's {args.file_mib} MiB file, not read yet"), at(a, opened))
 
         # Whole files, 1 MiB reads, one file at a time.

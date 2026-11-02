@@ -1,17 +1,22 @@
 //! The union as a read-only FUSE file system: the folders and files of every node's
 //! export (index.rs).
 //!
-//! With passthrough (Linux 6.9), the kernel reads a file itself: a file of this node
-//! from the export, and a file of another node from a memfd it is fetched into when it
-//! is opened. Reads and mappings then never come to rview-fs.
+//! A file of this node is read from the export: by the kernel itself with passthrough
+//! (Linux 6.9), every open of a file sharing one backing file, and otherwise by rview-fs.
 //!
-//! Otherwise rview-fs serves the reads. A file of this node is read from the local disk.
-//! A file of another node is staged there when it is opened, which keeps it even if that
-//! node's cleanup deletes it, and fetched into memory when any byte of it is first read:
-//! a mapped page moves when the first fault touches it. Once read, the open file keeps
-//! its bytes until it is closed, which a mapping of it is only once unmapped: the kernel
-//! may drop the pages it read and fault them in again, and that must not need the other
-//! node still up.
+//! A file of another node is opened there too, and held open until it is closed here
+//! (held.rs, remote.rs): that node may delete it meanwhile and it is still read whole.
+//! Nothing of it moves until it is read: the first read fetches all of it into memory,
+//! a mapped file's first fault included, and rview-fs serves its reads from there. A file
+//! opened and never read is never fetched. An open file keeps its bytes until it is
+//! closed, which a mapping of it is only once unmapped: the kernel may drop the pages it
+//! read and fault them in again, and that must not need the other node still up. A file
+//! read before comes from the cache, without asking its node.
+//!
+//! The kernel serves an inode either through rview-fs, keeping what it read, or passed
+//! through, and refuses an open of the one kind while the other is open (ETXTBSY). Every
+//! open of a file is of one kind: passed through for a file of this node, and served for
+//! a file of another.
 //!
 //! FUSE requests run on fractal-fuse's threads. Anything that blocks or talks to velo
 //! runs on the tokio runtime, and the request awaits it.
@@ -34,13 +39,14 @@ use fractal_fuse::{
 };
 use parking_lot::Mutex;
 
+use bytes::Bytes;
+
 use crate::cache::Key;
-use crate::content::Content;
 use crate::index::{Entry, EntryKind, FileView};
 use crate::passthrough::Passthrough;
 use crate::path::join;
+use crate::remote::RemoteFile;
 use crate::state::State;
-use crate::transfer::Staged;
 
 // Files never change once written, but they come and go.
 const TTL: Duration = Duration::from_secs(1);
@@ -107,15 +113,17 @@ impl Inodes {
 }
 
 enum Source {
-    /// The kernel reads it itself, from the file registered under this id.
-    Passthrough(i32),
+    /// A file of this node the kernel reads itself, from the backing file of inode `ino`
+    /// registered under `id`.
+    Passthrough { ino: u64, id: i32 },
+    /// A file of this node.
     Local(Arc<File>),
+    /// A file of another node, read before.
+    Fetched(Bytes),
+    /// A file of another node, which holds it open for us; fetched by the first read.
     Remote {
-        key: Key,
-        // Taken by the first read that fetches the file.
-        staged: Mutex<Option<Staged>>,
-        // The file once read.
-        content: Mutex<Option<Content>>,
+        file: RemoteFile,
+        bytes: Mutex<Option<Bytes>>,
     },
 }
 
@@ -184,25 +192,20 @@ impl RviewFs {
         self.state.index.read().lookup(path).ok_or(ENOENT)
     }
 
-    fn passing_through(&self) -> bool {
-        self.passthrough.as_ref().is_some_and(|p| p.is_on())
-    }
-
-    fn pass_through(&self, file: &File) -> Option<i32> {
-        self.passthrough.as_ref()?.register(file)
-    }
-
-    /// Where the bytes of `file` come from: this node's disk when it has the file, else
-    /// another node, which stages it for us. Passed through, a file of another node is
-    /// fetched now, into a memfd the kernel reads; otherwise on the first read.
-    async fn open_file(&self, file: FileView) -> FsResult<OpenFile> {
+    /// Where the bytes of inode `ino`, `file`, come from: this node's disk when it has
+    /// the file, else another node, which holds it open for us.
+    async fn open_file(&self, ino: u64, file: FileView) -> FsResult<OpenFile> {
         let size = file.size;
         if file.nodes.contains(&self.state.me) {
+            if let Some(id) = self.passthrough.as_ref().and_then(|p| p.reuse(ino)) {
+                let source = Source::Passthrough { ino, id };
+                return Ok(OpenFile { size, source });
+            }
             let path = self.state.export.join(file.path.as_str());
             match self.runtime.spawn_blocking(move || File::open(path)).await {
                 Ok(Ok(local)) => {
-                    let source = match self.pass_through(&local) {
-                        Some(id) => Source::Passthrough(id),
+                    let source = match self.passthrough.as_ref().and_then(|p| p.open(ino, &local)) {
+                        Some(id) => Source::Passthrough { ino, id },
                         None => Source::Local(Arc::new(local)),
                     };
                     return Ok(OpenFile { size, source });
@@ -218,64 +221,34 @@ impl RviewFs {
                 node: node.clone(),
                 path: file.path.clone(),
             };
-            let cached = self.state.cache.get(&key);
-            let staged = match &cached {
-                Some(_) => None,
-                None => {
-                    let state = Arc::clone(&self.state);
-                    let stage_key = key.clone();
-                    match self
-                        .runtime
-                        .spawn(async move { state.stage(&stage_key).await })
-                        .await
-                    {
-                        Ok(Ok(Some(staged))) => Some(staged),
-                        Ok(Ok(None)) => continue,
-                        Ok(Err(e)) => {
-                            tracing::warn!(node = node.as_str(), path = %file.path, "staging failed: {e:#}");
-                            failed = true;
-                            continue;
-                        }
-                        Err(_) => return Err(EIO),
-                    }
-                }
-            };
-            if !self.passing_through() {
-                let source = Source::Remote {
-                    key,
-                    staged: Mutex::new(staged),
-                    content: Mutex::new(cached),
-                };
-                return Ok(OpenFile { size, source });
+            if let Some(bytes) = self.state.cache.get(&key) {
+                let size = bytes.len() as u64;
+                return Ok(OpenFile {
+                    size,
+                    source: Source::Fetched(bytes),
+                });
             }
-            let content = match cached {
-                Some(content) => content,
-                None => {
-                    let (state, fetch_key) = (Arc::clone(&self.state), key.clone());
-                    match self
-                        .runtime
-                        .spawn(async move { state.remote_content(&fetch_key, staged).await })
-                        .await
-                    {
-                        Ok(Ok(content)) => content,
-                        Ok(Err(e)) => {
-                            tracing::warn!(node = node.as_str(), path = %file.path, "fetching failed: {e:#}");
-                            failed = true;
-                            continue;
-                        }
-                        Err(_) => return Err(EIO),
-                    }
+            let (state, runtime) = (Arc::clone(&self.state), self.runtime.clone());
+            match self
+                .runtime
+                .spawn(async move { RemoteFile::open(state, key, runtime).await })
+                .await
+            {
+                Ok(Ok(Some(remote))) => {
+                    let size = remote.remote.size;
+                    let source = Source::Remote {
+                        file: remote,
+                        bytes: Mutex::new(None),
+                    };
+                    return Ok(OpenFile { size, source });
                 }
-            };
-            let source = match self.pass_through(&content.file) {
-                Some(id) => Source::Passthrough(id),
-                None => Source::Remote {
-                    key,
-                    staged: Mutex::new(None),
-                    content: Mutex::new(Some(content)),
-                },
-            };
-            return Ok(OpenFile { size, source });
+                Ok(Ok(None)) => continue, // deleted there since
+                Ok(Err(e)) => {
+                    tracing::warn!(node = node.as_str(), path = %file.path, "opening failed: {e:#}");
+                    failed = true;
+                }
+                Err(_) => return Err(EIO),
+            }
         }
         // Gone from every node that had it, unless one could not be asked.
         Err(if failed { EIO } else { ENOENT })
@@ -284,7 +257,7 @@ impl RviewFs {
     async fn read_file(&self, file: &OpenFile, from: u64, to: u64, dst: &mut [u8]) -> FsResult<()> {
         match &file.source {
             // The kernel reads a file passed through itself, and never asks.
-            Source::Passthrough(_) => return Err(EIO),
+            Source::Passthrough { .. } => return Err(EIO),
             Source::Local(file) => {
                 let file = Arc::clone(file);
                 let len = (to - from) as usize;
@@ -299,28 +272,27 @@ impl RviewFs {
                     .map_err(|e| io_errno(&e))?;
                 dst.copy_from_slice(&data);
             }
-            Source::Remote {
-                key,
-                staged,
-                content,
-            } => {
-                let held = content.lock().clone();
+            Source::Fetched(bytes) => {
+                let src = bytes.get(from as usize..to as usize).ok_or(EIO)?;
+                dst.copy_from_slice(src);
+            }
+            Source::Remote { file, bytes } => {
+                let held = bytes.lock().clone();
                 let data = match held {
-                    Some(held) => held.bytes,
+                    Some(held) => held,
                     None => {
-                        let staged = staged.lock().take();
-                        let (state, key) = (Arc::clone(&self.state), key.clone());
+                        let (state, remote) = (Arc::clone(&self.state), file.remote.clone());
                         let fetched = self
                             .runtime
-                            .spawn(async move { state.remote_content(&key, staged).await })
+                            .spawn(async move { state.remote_content(&remote).await })
                             .await
                             .map_err(|_| EIO)?
                             .map_err(|e| {
                                 tracing::error!("reading a file of another node failed: {e:#}");
                                 EIO
                             })?;
-                        *content.lock() = Some(fetched.clone());
-                        fetched.bytes
+                        *bytes.lock() = Some(fetched.clone());
+                        fetched
                     }
                 };
                 let src = data.get(from as usize..to as usize).ok_or(EIO)?;
@@ -369,11 +341,11 @@ impl Filesystem for RviewFs {
         let Entry::File(file) = self.entry(&self.path(inode)?)? else {
             return Err(EISDIR);
         };
-        let file = Arc::new(self.open_file(file).await?);
+        let file = Arc::new(self.open_file(inode.0, file).await?);
         let (flags, backing_id) = match &file.source {
-            Source::Passthrough(id) => (FOPEN_PASSTHROUGH, *id),
+            Source::Passthrough { id, .. } => (FOPEN_PASSTHROUGH, *id),
             // A file never changes once written, so the kernel may keep what it read.
-            Source::Local(_) | Source::Remote { .. } => (FOPEN_KEEP_CACHE, 0),
+            Source::Local(_) | Source::Fetched(_) | Source::Remote { .. } => (FOPEN_KEEP_CACHE, 0),
         };
         let mut open = self.open.lock();
         open.next += 1;
@@ -423,25 +395,14 @@ impl Filesystem for RviewFs {
         let Some(file) = self.open.lock().files.remove(&fh.0) else {
             return Ok(());
         };
-        match &file.source {
-            Source::Passthrough(id) => {
-                if let Some(passthrough) = &self.passthrough {
-                    passthrough.unregister(*id);
-                }
-            }
-            // A stage nobody read: its node keeps it in memory until told.
-            Source::Remote { key, staged, .. } => {
-                if let Some(staged) = staged.lock().take() {
-                    let (state, key) = (Arc::clone(&self.state), key.clone());
-                    self.runtime.spawn(async move {
-                        if let Err(e) = state.unstage(&key, staged).await {
-                            tracing::debug!(node = key.node.as_str(), path = %key.path, "releasing a stage failed: {e:#}");
-                        }
-                    });
-                }
-            }
-            Source::Local(_) => {}
+        if let (Source::Passthrough { ino, .. }, Some(passthrough)) =
+            (&file.source, &self.passthrough)
+        {
+            passthrough.release(*ino);
         }
+        // A file of another node is closed there once the last read of it is done, when
+        // the last reference goes (remote.rs).
+        drop(file);
         Ok(())
     }
 

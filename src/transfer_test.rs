@@ -35,18 +35,34 @@ fn staging_stays_within_its_budget() {
     let first = stage(6);
     stages.add(first, 6);
     assert!(!stages.reserve(6, &store)); // 12 bytes would be over 10
-    // A reader that closes the file unread releases its stage.
-    stages.release(first, &store);
-    assert_eq!(stages.bytes(), 0);
-    assert!(store.get_total_len(first.unpack().1).is_none());
-    // One that took it, and let go, leaves nothing staged either.
-    assert!(stages.reserve(6, &store));
-    let second = stage(6);
-    stages.add(second, 6);
-    store.remove(second.unpack().1);
+    // A reader that took it, and let go, leaves nothing staged.
+    store.remove(first.unpack().1);
     assert!(stages.reserve(6, &store));
     assert_eq!(stages.bytes(), 6);
     // A file bigger than the whole budget is staged alone.
     let stages = Stages::new(10);
     assert!(stages.reserve(20, &store) && !stages.reserve(1, &store));
+}
+
+#[test]
+fn opening_a_file_for_another_node_marks_it_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.bin");
+    std::fs::write(&path, b"1234").unwrap();
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let (_, size) = open_export_file(&path).unwrap().unwrap();
+    assert_eq!(size, 4);
+    assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > old);
+    assert!(
+        open_export_file(&dir.path().join("gone.bin"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(open_export_file(dir.path()).is_err()); // a folder
 }

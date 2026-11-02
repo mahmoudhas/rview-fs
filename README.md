@@ -137,69 +137,52 @@ say, or `"--cache-gib 1"` to measure fetches that reuse memory the cache freed.
 
 The results below are medians of 3 runs on one machine with Linux 6.14 (an OCI GPU node,
 256 CPUs), its exports on the machine's NVMe RAID (ext4); 8 files of 64 MiB in each set,
-2000 files of 4 KiB, and 8 readers in the parallel stages.
-
-Files between the machines over TCP, without passthrough and with:
+2000 files of 4 KiB, and 8 readers in the parallel stages. Files moved between the two
+rview-fs over RDMA (one RoCE port, `mlx5_0`, looped back to itself): every one of them
+`rdma/ok` but a 4 KiB file below RDMA's minimum. Without passthrough and with:
 
 | stage | MB/op | p50 ms, without | p50 ms, with | GB/s, without | GB/s, with |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| announced file shown by another machine | – | 0.0475 | 0.0532 | – | – |
-| stat, first (another machine's 2000 small files) | – | 0.0291 | 0.0219 | – | – |
-| stat, again (another machine's 2000 small files) | – | 0.00628 | 0.00605 | – | – |
-| list a folder of 2000 files | – | 3.46 | 3.09 | – | – |
-| open, local disk, not rview-fs | – | 0.00655 | 0.00615 | – | – |
-| open, this machine's file | – | 0.0571 | 0.0407 | – | – |
-| open, another machine's 64 MiB file, not read yet | – | 0.254 | 80 | – | – |
-| read, local disk, not rview-fs, cold | 67.1 | 30.3 | 27 | 2.21 | 2.49 |
-| read, local disk, not rview-fs, cached | 67.1 | 10.5 | 9.29 | 6.51 | 7.39 |
-| read, this machine's file, cold | 67.1 | 60.8 | 26.7 | 1.11 | 2.55 |
-| read, this machine's file, cached | 67.1 | 12.2 | 9.49 | 5.83 | 7.3 |
-| read, another machine's file, fetched | 67.1 | 113 | 87 | 0.585 | 0.772 |
-| read, another machine's file, first MiB (fetches the file) | 1.05 | 78 | 0.181 | 0.0134 | 5.85 |
-| read, another machine's file, cached | 67.1 | 11.6 | 10.3 | 5.67 | 6.54 |
-| read, another machine's file, from rview-fs memory | 67.1 | 35.4 | 10.3 | 1.89 | 6.47 |
-| open, another machine's file, in rview-fs memory | – | 0.0218 | 0.0193 | – | – |
-| 4 KiB random read, local disk, not rview-fs, cold | 0.0041 | 0.0673 | 0.0669 | 0.0602 | 0.0604 |
-| 4 KiB random read, this machine's file, cold | 0.0041 | 0.11 | 0.0671 | 0.0382 | 0.061 |
-| 4 KiB random read, another machine's file, from rview-fs memory | 0.0041 | 0.0259 | 0.00133 | 0.158 | 3.02 |
-| map and fault in, this machine's file, cold | 67.1 | 74.6 | 21.9 | 0.909 | 3.03 |
-| map and fault in, another machine's file, fetched | 67.1 | 109 | 79.1 | 0.62 | 0.851 |
-| map, then touch a random page, another machine's file, fetched on the first | 0.0041 | 0.128 | 0.00251 | 0.00312 | 0.00335 |
-| read, another machine's files, fetched, 8 at once | 67.1 | 413 | 375 | 1.28 | 1.41 |
-| read, another machine's files, from rview-fs memory, 8 at once | 67.1 | 41.2 | 13 | 8.9 | 33.5 |
-| read, this machine's files, cold, 8 at once | 67.1 | 167 | 33.1 | 2.94 | 15.1 |
-
-Over RDMA (one RoCE port, `mlx5_0`, looped back to itself), with passthrough, the stages
-that move the other machine's files:
-
-| stage | ops | MB/op | ops/s | GB/s | p50 ms | p90 ms | max ms |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| open, another machine's 64 MiB file, not read yet | 8 | – | 10.8 | – | 79.2 | 80 | 187 |
-| read, another machine's file, fetched | 8 | 67.1 | 12 | 0.803 | 83.3 | 84 | 84.9 |
-| read, another machine's file, first MiB (fetches the file) | 8 | 1.05 | 4,813 | 5.05 | 0.202 | 0.218 | 0.265 |
-| read, another machine's file, cached | 8 | 67.1 | 74.5 | 5 | 13.4 | 13.5 | 13.5 |
-| read, another machine's file, from rview-fs memory | 8 | 67.1 | 76.6 | 5.14 | 13.2 | 13.2 | 13.2 |
-| open, another machine's file, in rview-fs memory | 8 | – | 40,421 | – | 0.0244 | 0.0247 | 0.0304 |
-| 4 KiB random read, another machine's file, from rview-fs memory | 4000 | 0.0041 | 601,954 | 2.47 | 0.00165 | 0.00198 | 0.00864 |
-| map and fault in, another machine's file, fetched | 8 | 67.1 | 12.8 | 0.859 | 76 | 77.4 | 97.7 |
-| map, then touch a random page, another machine's file, fetched on the first | 512 | 0.0041 | 880 | 0.0036 | 0.00341 | 0.00395 | 73.2 |
-| read, another machine's files, fetched, 8 at once | 16 | 67.1 | 28.4 | 1.91 | 161 | 454 | 486 |
-| read, another machine's files, from rview-fs memory, 8 at once | 16 | 67.1 | 520 | 34.9 | 13.9 | 14.5 | 15.3 |
+| announced file shown by another machine | – | 0.0468 | 0.048 | – | – |
+| stat, first (another machine's 2000 small files) | – | 0.0303 | 0.0316 | – | – |
+| stat, again (another machine's 2000 small files) | – | 0.00611 | 0.00627 | – | – |
+| list a folder of 2000 files | – | 3.51 | 3.57 | – | – |
+| open, local disk, not rview-fs | – | 0.00679 | 0.00662 | – | – |
+| open, this machine's file | – | 0.0554 | 0.0641 | – | – |
+| open, another machine's 64 MiB file, not read yet | – | 0.234 | 0.202 | – | – |
+| read, local disk, not rview-fs, cold | 67.1 | 32.4 | 31.4 | 2.16 | 2.14 |
+| read, local disk, not rview-fs, cached | 67.1 | 10.8 | 10.7 | 6.52 | 6.37 |
+| read, this machine's file, cold | 67.1 | 67.5 | 30.4 | 0.989 | 2.29 |
+| read, this machine's file, cached | 67.1 | 12.4 | 10.9 | 5.7 | 6.32 |
+| read, another machine's file, fetched | 67.1 | 84.6 | 87.2 | 0.693 | 0.664 |
+| read, another machine's file, first MiB (fetches the file) | 1.05 | 49.2 | 50.1 | 0.0167 | 0.0164 |
+| read, another machine's file, cached | 67.1 | 13.2 | 13.5 | 5.17 | 5.03 |
+| read, another machine's file, from rview-fs memory | 67.1 | 35.4 | 36.2 | 1.9 | 1.84 |
+| open, another machine's file, in rview-fs memory | – | 0.021 | 0.0208 | – | – |
+| 4 KiB random read, local disk, not rview-fs, cold | 0.0041 | 0.0673 | 0.0673 | 0.06 | 0.0601 |
+| 4 KiB random read, this machine's file, cold | 0.0041 | 0.112 | 0.0674 | 0.0374 | 0.0606 |
+| 4 KiB random read, another machine's file, from rview-fs memory | 0.0041 | 0.0256 | 0.027 | 0.159 | 0.15 |
+| map and fault in, this machine's file, cold | 67.1 | 72.6 | 23.4 | 0.981 | 2.92 |
+| map and fault in, another machine's file, fetched | 67.1 | 78.8 | 78.2 | 0.848 | 0.863 |
+| map, then touch a random page, another machine's file, fetched on the first | 0.0041 | 0.131 | 0.13 | 0.00463 | 0.00457 |
+| read, another machine's files, fetched, 8 at once | 67.1 | 162 | 165 | 2 | 2.1 |
+| read, another machine's files, from rview-fs memory, 8 at once | 67.1 | 38.5 | 40.6 | 9.41 | 8.12 |
+| read, this machine's files, cold, 8 at once | 67.1 | 133 | 34.3 | 3.81 | 14.3 |
 
 What it shows:
 
 - **Metadata:** a file another machine announces shows up about 50 µs later. A `stat`
-  takes 22–29 µs the first time and 6 µs while the kernel keeps the answer (1 s). Listing
-  a folder of 2000 files takes 3–3.5 ms.
-- **This machine's files, passed through,** read as fast as the disk read directly: 2.5
-  GB/s cold for one reader, 15 GB/s for 8, and a random 4 KiB read in 67 µs. Served by
-  rview-fs instead, they read at 1.1 GB/s, 2.9 GB/s for 8 readers, and 110 µs.
-- **Another machine's file** is fetched when it is opened: 80 ms for 64 MiB, over TCP or
-  RDMA alike. After that, passed through, it reads like memory: 6.5 GB/s for one reader,
-  34 GB/s for 8, and a random 4 KiB read in about 1.5 µs, where serving it through
-  rview-fs gives 1.9 GB/s, 8.9 GB/s, and 26 µs.
-- **The fetch is what is left to make faster:** a 64 MiB file moves at about 0.8 GB/s
-  between two rview-fs on one machine, over TCP or RDMA; 1.4–1.9 GB/s with 8 at once.
+  takes about 30 µs the first time and 6 µs while the kernel keeps the answer (1 s).
+  Listing a folder of 2000 files takes 3.5 ms.
+- **This machine's files, passed through,** read as fast as the disk read directly: 2.3
+  GB/s cold for one reader, 14 GB/s for 8, and a random 4 KiB read in 67 µs. Served by
+  rview-fs instead, they read at 1 GB/s, 3.8 GB/s for 8 readers, and 112 µs.
+- **Another machine's file** opens in 0.2 ms: it is held open there, and nothing moves.
+  Its first read fetches all of it, 50 ms for 64 MiB, and a file never read is never
+  fetched. rview-fs then serves it from memory: 1.9 GB/s for one reader, 8–9 GB/s for 8,
+  and a random 4 KiB read in 26 µs; what the kernel keeps reads at 5 GB/s.
+- **Fetching is what is left to make faster:** a 64 MiB file moves at about 0.7–0.9 GB/s
+  between two rview-fs on one machine, about 2 GB/s with 8 at once.
 
 ## Building and testing
 

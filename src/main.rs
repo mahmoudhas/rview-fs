@@ -285,14 +285,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let stages = Arc::new(transfer::Stages::new(
         (args.stage_gib * f64::from(1u32 << 30)) as u64,
     ));
-    tasks.spawn(transfer::serve(
-        velo.clone(),
+    // Before the first heartbeat (watch_nodes): a node that hears it lists this one at
+    // once, and a listing that finds no handler fails.
+    transfer::serve(
+        &velo,
         args.export.clone(),
         pinned,
-        stages,
-        held,
-        cancel.clone(),
-    ));
+        Arc::clone(&stages),
+        Arc::clone(&held),
+    )?;
+    tasks.spawn(transfer::reap(velo.clone(), stages, held, cancel.clone()));
     tasks.spawn(remote::renew(Arc::clone(&state), cancel.clone()));
     tasks.spawn(sync::rescan(Arc::clone(&state), cancel.clone()));
     tasks.spawn(log_transfer_paths(

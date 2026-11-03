@@ -19,7 +19,8 @@ their files on [NATS](https://nats.io).
   union of every machine's export (`--mount`).
 - Whatever writes into an export announces each file it adds or deletes on NATS. Each
   rview-fs keeps an index of every machine's files from those announcements, and lists a
-  machine's export when the machine shows up and every 10 minutes.
+  machine's export when the machine shows up, again until it answers, and every 10
+  minutes.
 - Opening a file of this machine hands the export's file to the kernel, which reads and
   maps it with no request to rview-fs. All the opens of a file share one backing file,
   the one the kernel allows a file at a time.
@@ -46,6 +47,22 @@ leaves it open:
 - A machine silent for 60 s has all of its files closed.
 - rview-fs raises its open-file limit to the most it may (at most 2^20), and holds at most
   half of it open for the others; an open past that fails, and says why.
+
+### Machines that go down and come back up
+
+A machine that comes up, new or back, heartbeats at once. Every rview-fs that hears it
+lists its export whole, and heartbeats back so that it lists theirs: each gets the files
+the other had already, not only those announced since.
+
+- A listing that fails, of a machine not reachable yet or too busy to answer, is made
+  again 1 s later, and twice as long after each time since, up to 30 s, until the machine
+  answers, goes, or restarts. rview-fs answers listings before it first heartbeats.
+- A machine that restarts within 30 s keeps the files it had until its listing replaces
+  them; one silent for 30 s is gone, and so are its files, until it comes back.
+- A listing that answers after its machine went or restarted is dropped: it brings back no
+  files of a machine gone.
+- A machine that heartbeats an address velo cannot use is left out, and said so at each
+  heartbeat, until it heartbeats one velo can.
 
 ## What it needs, and what happens without
 

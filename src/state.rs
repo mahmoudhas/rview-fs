@@ -20,6 +20,7 @@ pub struct State {
     // Read by every FUSE lookup, on many threads, and changed by the NATS tasks; each
     // holds it for one lookup or one batch of updates, and never across an await.
     pub index: RwLock<Index>,
+    // Held while a listing goes into `index` (sync.rs): taken before it, never after.
     pub nodes: RwLock<Nodes>,
     /// Files of other nodes, once read.
     pub cache: ContentCache<Bytes>,

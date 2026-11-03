@@ -237,15 +237,14 @@ impl StageList {
     }
 }
 
-/// Serve this node's export at `root` to the other nodes until cancelled. With `pinned`,
-/// files are staged in RDMA-registered memory.
-pub async fn serve(
-    velo: Velo,
+/// Serve this node's export at `root` to the other nodes: its handlers, registered when
+/// this returns. With `pinned`, files are staged in RDMA-registered memory.
+pub fn serve(
+    velo: &Velo,
     root: PathBuf,
     pinned: bool,
     stages: Arc<Stages>,
     held: Arc<Held<InstanceId>>,
-    cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let list_root = root.clone();
     velo.register_handler(
@@ -348,6 +347,17 @@ pub async fn serve(
         })
         .build(),
     )?;
+    Ok(())
+}
+
+/// Drop the stages nobody took in time, and close the files of the nodes gone silent,
+/// until cancelled.
+pub async fn reap(
+    velo: Velo,
+    stages: Arc<Stages>,
+    held: Arc<Held<InstanceId>>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(REAP_EVERY);
     loop {
         tokio::select! {

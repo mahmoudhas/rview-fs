@@ -14,9 +14,11 @@
 //! read before comes from the cache, without asking its node.
 //!
 //! The kernel serves an inode either through rview-fs, keeping what it read, or passed
-//! through, and refuses an open of the one kind while the other is open (ETXTBSY). Every
-//! open of a file is of one kind: passed through for a file of this node, and served for
-//! a file of another.
+//! through, and fails an open of the one kind while one of the other is open (EIO). A
+//! file of this node is passed through and one of another served, but a file two nodes
+//! have can come to this node, or go from it, while it is open: an open of an inode is
+//! of the kind of those still open (Kinds), served from this node's disk, or passed
+//! through to the backing file of the others even once deleted here.
 //!
 //! FUSE requests run on fractal-fuse's threads. Anything that blocks or talks to velo
 //! runs on the tokio runtime, and the request awaits it.
@@ -128,6 +130,7 @@ enum Source {
 }
 
 struct OpenFile {
+    ino: u64,
     size: u64,
     source: Source,
 }
@@ -136,6 +139,51 @@ struct OpenFile {
 struct OpenFiles {
     files: HashMap<u64, Arc<OpenFile>>,
     next: u64,
+    kinds: Kinds,
+}
+
+/// How the kernel reads an inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    PassedThrough,
+    Served,
+}
+
+/// The kind of every inode open, and how many opens of it are; counted from the start
+/// of an open, so that two at once agree.
+#[derive(Default)]
+struct Kinds(HashMap<u64, (Kind, usize)>);
+
+impl Kinds {
+    /// One more open of `ino`: of kind `want`, unless opens of it are, whose kind it
+    /// takes. The kind it is of.
+    fn begin(&mut self, ino: u64, want: Kind) -> Kind {
+        let (kind, opens) = self.0.entry(ino).or_insert((want, 0));
+        *opens += 1;
+        *kind
+    }
+
+    /// An open of `ino` that `begin` counted is closed, or failed.
+    fn end(&mut self, ino: u64) {
+        let Some((_, opens)) = self.0.get_mut(&ino) else {
+            return;
+        };
+        *opens -= 1;
+        if *opens == 0 {
+            self.0.remove(&ino);
+        }
+    }
+
+    /// Serve the open of `ino` begun, when it is the only one; whether it is.
+    fn serve_alone(&mut self, ino: u64) -> bool {
+        match self.0.get_mut(&ino) {
+            Some((kind, 1)) => {
+                *kind = Kind::Served;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn timestamp(seconds: f64) -> Timestamp {
@@ -193,27 +241,75 @@ impl RviewFs {
     }
 
     /// Where the bytes of inode `ino`, `file`, come from: this node's disk when it has
-    /// the file, else another node, which holds it open for us.
+    /// the file, else another node, which holds it open for us. The open is counted in
+    /// `kinds` until it is released, or here when it fails.
     async fn open_file(&self, ino: u64, file: FileView) -> FsResult<OpenFile> {
+        let ours = file.nodes.contains(&self.state.me);
+        let want = match &self.passthrough {
+            Some(passthrough) if ours && passthrough.is_on() => Kind::PassedThrough,
+            _ => Kind::Served,
+        };
+        let kind = self.open.lock().kinds.begin(ino, want);
+        let opened = match kind {
+            Kind::PassedThrough => self.open_passed_through(ino, &file).await,
+            Kind::Served => self.open_served(ino, &file, ours).await,
+        };
+        if opened.is_err() {
+            self.open.lock().kinds.end(ino);
+        }
+        opened
+    }
+
+    /// An open passed through: to the backing file of the inode's other opens, or to this
+    /// node's file. Served instead when neither can be and no other open is, or failed.
+    async fn open_passed_through(&self, ino: u64, file: &FileView) -> FsResult<OpenFile> {
         let size = file.size;
-        if file.nodes.contains(&self.state.me) {
-            if let Some(id) = self.passthrough.as_ref().and_then(|p| p.reuse(ino)) {
-                let source = Source::Passthrough { ino, id };
-                return Ok(OpenFile { size, source });
-            }
-            let path = self.state.export.join(file.path.as_str());
-            match self.runtime.spawn_blocking(move || File::open(path)).await {
-                Ok(Ok(local)) => {
-                    let source = match self.passthrough.as_ref().and_then(|p| p.open(ino, &local)) {
-                        Some(id) => Source::Passthrough { ino, id },
-                        None => Source::Local(Arc::new(local)),
-                    };
-                    return Ok(OpenFile { size, source });
-                }
-                Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => {} // deleted since
-                Ok(Err(e)) => return Err(io_errno(&e)),
-                Err(_) => return Err(EIO),
-            }
+        let Some(passthrough) = &self.passthrough else {
+            return Err(EIO);
+        };
+        if let Some(id) = passthrough.reuse(ino) {
+            let source = Source::Passthrough { ino, id };
+            return Ok(OpenFile { ino, size, source });
+        }
+        let local = self.open_local(file).await?;
+        if let Some(local) = &local
+            && let Some(id) = passthrough.open(ino, local)
+        {
+            let source = Source::Passthrough { ino, id };
+            return Ok(OpenFile { ino, size, source });
+        }
+        if !self.open.lock().kinds.serve_alone(ino) {
+            // Opens passed through that have not registered their backing file yet, or
+            // whose file went from here before they could.
+            return Err(EIO);
+        }
+        match local {
+            Some(local) => Ok(OpenFile {
+                ino,
+                size,
+                source: Source::Local(Arc::new(local)),
+            }),
+            None => self.open_served(ino, file, false).await,
+        }
+    }
+
+    /// This node's file, or None when it is gone.
+    async fn open_local(&self, file: &FileView) -> FsResult<Option<File>> {
+        let path = self.state.export.join(file.path.as_str());
+        match self.runtime.spawn_blocking(move || File::open(path)).await {
+            Ok(Ok(local)) => Ok(Some(local)),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None), // deleted since
+            Ok(Err(e)) => Err(io_errno(&e)),
+            Err(_) => Err(EIO),
+        }
+    }
+
+    /// An open rview-fs serves: from this node's disk when `ours`, else another node's.
+    async fn open_served(&self, ino: u64, file: &FileView, ours: bool) -> FsResult<OpenFile> {
+        let size = file.size;
+        if ours && let Some(local) = self.open_local(file).await? {
+            let source = Source::Local(Arc::new(local));
+            return Ok(OpenFile { ino, size, source });
         }
         let mut failed = false;
         for node in file.nodes.iter().filter(|n| **n != self.state.me) {
@@ -224,6 +320,7 @@ impl RviewFs {
             if let Some(bytes) = self.state.cache.get(&key) {
                 let size = bytes.len() as u64;
                 return Ok(OpenFile {
+                    ino,
                     size,
                     source: Source::Fetched(bytes),
                 });
@@ -240,7 +337,7 @@ impl RviewFs {
                         file: remote,
                         bytes: Mutex::new(None),
                     };
-                    return Ok(OpenFile { size, source });
+                    return Ok(OpenFile { ino, size, source });
                 }
                 Ok(Ok(None)) => continue, // deleted there since
                 Ok(Err(e)) => {
@@ -392,7 +489,14 @@ impl Filesystem for RviewFs {
         _flush: bool,
         _flock_release: bool,
     ) -> FsResult<()> {
-        let Some(file) = self.open.lock().files.remove(&fh.0) else {
+        let Some(file) = ({
+            let mut open = self.open.lock();
+            let file = open.files.remove(&fh.0);
+            if let Some(file) = &file {
+                open.kinds.end(file.ino);
+            }
+            file
+        }) else {
             return Ok(());
         };
         if let (Source::Passthrough { ino, .. }, Some(passthrough)) =
@@ -555,3 +659,7 @@ fn file_type(kind: EntryKind) -> FileType {
         EntryKind::File => FileType::RegularFile,
     }
 }
+
+#[cfg(test)]
+#[path = "fs_test.rs"]
+mod tests;

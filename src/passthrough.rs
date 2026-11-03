@@ -151,11 +151,8 @@ impl Passthrough {
     }
 
     /// The backing file of inode `ino`, when an open of it is passed through already: one
-    /// more open of it uses it too.
+    /// more open of it uses it too, even once passthrough is off.
     pub fn reuse(&self, ino: u64) -> Option<i32> {
-        if !self.is_on() {
-            return None;
-        }
         self.backings.lock().reuse(ino)
     }
 

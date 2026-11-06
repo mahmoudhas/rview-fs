@@ -1679,6 +1679,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "prometheus",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

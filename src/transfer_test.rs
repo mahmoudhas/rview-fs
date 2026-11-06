@@ -56,13 +56,32 @@ fn opening_a_file_for_another_node_marks_it_used() {
         .unwrap()
         .set_modified(old)
         .unwrap();
-    let (_, size) = open_export_file(&path).unwrap().unwrap();
+    let rel = |path: &str| RelPath::parse(path).unwrap();
+    let (_, size) = open_export_file(dir.path(), &rel("x.bin"))
+        .unwrap()
+        .unwrap();
     assert_eq!(size, 4);
     assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > old);
     assert!(
-        open_export_file(&dir.path().join("gone.bin"))
+        open_export_file(dir.path(), &rel("gone.bin"))
             .unwrap()
             .is_none()
     );
-    assert!(open_export_file(dir.path()).is_err()); // a folder
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    assert!(open_export_file(dir.path(), &rel("sub")).is_err()); // a folder
+}
+
+#[test]
+fn files_deeper_than_a_path_takes_are_listed_and_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = crate::path::tests::deep_file(dir.path(), 150, b"deep");
+    let listed: Vec<(String, u64)> = scan(dir.path())
+        .unwrap()
+        .files
+        .into_iter()
+        .map(|f| (f.path, f.size))
+        .collect();
+    assert_eq!(listed, vec![(path.as_str().to_owned(), 4)]);
+    let (_, size) = open_export_file(dir.path(), &path).unwrap().unwrap();
+    assert_eq!(size, 4);
 }

@@ -295,8 +295,12 @@ impl RviewFs {
 
     /// This node's file, or None when it is gone.
     async fn open_local(&self, file: &FileView) -> FsResult<Option<File>> {
-        let path = self.state.export.join(file.path.as_str());
-        match self.runtime.spawn_blocking(move || File::open(path)).await {
+        let (export, path) = (self.state.export.clone(), file.path.clone());
+        match self
+            .runtime
+            .spawn_blocking(move || crate::path::open_file(&export, &path))
+            .await
+        {
             Ok(Ok(local)) => Ok(Some(local)),
             Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None), // deleted since
             Ok(Err(e)) => Err(io_errno(&e)),

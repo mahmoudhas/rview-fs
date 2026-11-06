@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,7 +24,7 @@ use velo::{DataHandle, Handler, InstanceId, TypedContext, Velo, WeakVelo};
 
 use crate::content;
 use crate::held::Held;
-use crate::path::RelPath;
+use crate::path::{self, RelPath};
 
 pub const LIST: &str = "rview_list";
 pub const OPEN: &str = "rview_open";
@@ -94,58 +95,65 @@ pub fn now() -> f64 {
 pub fn scan(root: &Path) -> io::Result<Listing> {
     let listed_at = now();
     let mut files = Vec::new();
-    let mut stack = vec![PathBuf::new()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(root.join(&dir)) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // removed meanwhile
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.starts_with('.') {
-                continue; // being written, so not shared
-            }
-            let rel = dir.join(name);
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                stack.push(rel);
-            } else if meta.is_file() {
-                let mtime = meta
-                    .modified()?
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_secs_f64());
-                files.push(Listed {
-                    path: rel.to_string_lossy().into_owned(),
-                    size: meta.len(),
-                    mtime,
-                });
-            }
-        }
+    match path::open_dir(root, "") {
+        Ok(top) => scan_dir(&top, "", &mut files)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {} // nothing exported yet
+        Err(e) => return Err(e),
     }
     Ok(Listing { files, listed_at })
 }
 
-/// The file of the export at `path`, open, and its size; None when it is not there.
-/// Opening it for another node counts as using it: its time is renewed, which a cleanup
-/// that deletes the least recently used files can go by. Blocks.
-pub fn open_export_file(path: &Path) -> io::Result<Option<(File, u64)>> {
-    let file = match File::open(path) {
+/// Every visible file in the folder `dir`, open as `fd`, and in the folders below it,
+/// each opened in the one above (`path::open_dir` says why). Blocks.
+fn scan_dir(fd: &OwnedFd, dir: &str, files: &mut Vec<Listed>) -> io::Result<()> {
+    for entry in rustix::fs::Dir::read_from(fd)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue; // being written, so not shared; and . and ..
+        }
+        let flags = rustix::fs::AtFlags::SYMLINK_NOFOLLOW;
+        let Ok(stat) = rustix::fs::statat(fd, name, flags) else {
+            continue; // removed meanwhile
+        };
+        let rel = path::join(dir, name);
+        match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+            rustix::fs::FileType::Directory => {
+                match rustix::fs::openat(fd, name, path::FOLDER, rustix::fs::Mode::empty()) {
+                    Ok(sub) => scan_dir(&sub, &rel, files)?,
+                    Err(rustix::io::Errno::NOENT) => {} // removed meanwhile
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            rustix::fs::FileType::RegularFile => files.push(Listed {
+                path: rel,
+                size: u64::try_from(stat.st_size).unwrap_or(0),
+                #[allow(clippy::cast_precision_loss)]
+                mtime: stat.st_mtime as f64 + stat.st_mtime_nsec as f64 / 1e9,
+            }),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The file at `path` in the export at `root`, open, and its size; None when it is not
+/// there. Opening it for another node counts as using it: its time is renewed, which a
+/// cleanup that deletes the least recently used files can go by. Blocks.
+pub fn open_export_file(root: &Path, path: &RelPath) -> io::Result<Option<(File, u64)>> {
+    let file = match path::open_file(root, path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
     if !meta.is_file() {
-        return Err(io::Error::other(format!(
-            "{} is not a file",
-            path.display()
-        )));
+        return Err(io::Error::other(format!("{path} is not a file")));
     }
     if let Err(e) = file.set_modified(SystemTime::now()) {
-        tracing::debug!(?path, %e, "could not mark a file another node opened as used");
+        tracing::debug!(%path, %e, "could not mark a file another node opened as used");
     }
     Ok(Some((file, meta.len())))
 }
@@ -264,9 +272,8 @@ pub fn serve(
             async move {
                 let path = RelPath::parse(&ctx.input.path)
                     .ok_or_else(|| anyhow!("not a path in the export: {:?}", ctx.input.path))?;
-                let file = root.join(path.as_str());
                 let Some((file, size)) =
-                    tokio::task::spawn_blocking(move || open_export_file(&file)).await??
+                    tokio::task::spawn_blocking(move || open_export_file(&root, &path)).await??
                 else {
                     return Ok(None);
                 };

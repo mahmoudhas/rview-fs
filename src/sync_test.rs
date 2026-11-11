@@ -89,6 +89,27 @@ fn export_of_one_file() -> tempfile::TempDir {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_bigger_than_a_message_is_listed() {
+    // A message carries at most 16 MiB, and the listing of thousands of files deep in
+    // folders is more: 5,000 paths of nearly 4 KiB.
+    let export = tempfile::tempdir().unwrap();
+    let deep: PathBuf = (0..15).map(|i| format!("{i:0>250}")).collect();
+    std::fs::create_dir_all(export.path().join(&deep)).unwrap();
+    for i in 0..5000 {
+        std::fs::write(export.path().join(&deep).join(format!("{i}.bin")), b"1234").unwrap();
+    }
+    let (ours, theirs) = (velo().await, velo().await);
+    ours.register_peer(theirs.peer_info()).unwrap();
+    serve(&theirs, export.path());
+    let state = state(ours);
+    let b = NodeId::parse("b").unwrap();
+    state.nodes.write().heard(b.clone(), theirs.instance_id());
+    list_node(&state, &b, theirs.instance_id()).await.unwrap();
+    let listed = state.index.read().list(deep.to_str().unwrap()).unwrap();
+    assert_eq!(listed.len(), 5000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_that_came_up_is_listed_again_until_it_answers() {
     let export = export_of_one_file();
     let (ours, theirs) = (velo().await, velo().await);

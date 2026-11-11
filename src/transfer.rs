@@ -4,8 +4,10 @@
 //! open for one of them from its open until its close (held.rs); and such a file's bytes,
 //! staged when it reads them. Staged in RDMA-registered memory (with the `ucx` feature),
 //! the reader's NIC reads them straight into the reader's host memory; otherwise they are
-//! pulled in chunks over TCP. The bytes staged at once are bounded; a stage is gone once
-//! its reader took it, and dropped after a while if it never does.
+//! pulled in chunks over TCP. A listing is staged too, in plain memory: a message carries
+//! at most 16 MiB, and the listing of tens of thousands of files deep in folders is more.
+//! The bytes staged at once are bounded; a stage is gone once its reader took it, and
+//! dropped after a while if it never does.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -269,13 +271,23 @@ pub fn serve(
     stages: Arc<Stages>,
     held: Arc<Held<InstanceId>>,
 ) -> anyhow::Result<()> {
-    let list_root = root.clone();
+    let (list_root, listed_by, listing_stages) =
+        (root.clone(), velo.downgrade(), Arc::clone(&stages));
     velo.register_handler(
         Handler::typed_unary_async(LIST, move |_ctx: TypedContext<ListRequest>| {
-            let root = list_root.clone();
+            let (root, weak, stages) = (
+                list_root.clone(),
+                listed_by.clone(),
+                Arc::clone(&listing_stages),
+            );
             async move {
-                let listing = tokio::task::spawn_blocking(move || scan(&root)).await??;
-                Ok(listing)
+                let json = tokio::task::spawn_blocking(move || {
+                    scan(&root)
+                        .and_then(|listing| serde_json::to_vec(&listing).map_err(io::Error::other))
+                })
+                .await??;
+                let velo = weak.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
+                stage(&velo, &stages, Bytes::from(json), false).await
             }
         })
         .build(),
@@ -321,20 +333,7 @@ pub fn serve(
                 })?;
                 let bytes = tokio::task::spawn_blocking(move || read_held(&file)).await??;
                 let velo = weak.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
-                let size = bytes.len() as u64;
-                let store = velo.rendezvous_manager().data_store();
-                anyhow::ensure!(
-                    stages.reserve(size, store),
-                    "no room to stage {size} bytes: {} staged",
-                    stages.bytes()
-                );
-                let handle = if pinned {
-                    velo.register_data_pinned(&bytes).await
-                } else {
-                    velo.register_data(bytes)
-                };
-                stages.add(handle, size);
-                Ok(Staged { handle, size })
+                stage(&velo, &stages, bytes, pinned).await
             }
         })
         .build(),
@@ -372,6 +371,25 @@ pub fn serve(
     Ok(())
 }
 
+/// Stage `bytes` for a node to take once, within the budget: in RDMA-registered memory
+/// when `pinned`.
+async fn stage(velo: &Velo, stages: &Stages, bytes: Bytes, pinned: bool) -> anyhow::Result<Staged> {
+    let size = bytes.len() as u64;
+    let store = velo.rendezvous_manager().data_store();
+    anyhow::ensure!(
+        stages.reserve(size, store),
+        "no room to stage {size} bytes: {} staged",
+        stages.bytes()
+    );
+    let handle = if pinned {
+        velo.register_data_pinned(&bytes).await
+    } else {
+        velo.register_data(bytes)
+    };
+    stages.add(handle, size);
+    Ok(Staged { handle, size })
+}
+
 /// Drop the stages nobody took in time, and close the files of the nodes gone silent,
 /// until cancelled.
 pub async fn reap(
@@ -395,13 +413,21 @@ pub async fn reap(
 }
 
 pub async fn list(velo: &Velo, instance: InstanceId) -> anyhow::Result<Listing> {
-    velo.typed_unary::<Listing>(LIST)?
+    let staged = velo
+        .typed_unary::<Staged>(LIST)?
         .payload(&ListRequest {})?
         .instance(instance)
         .timeout(CALL_TIMEOUT)
         .send()
         .await
-        .context("listing a peer's files")
+        .context("listing a peer's files")?;
+    let mut json = Vec::with_capacity(usize::try_from(staged.size).unwrap_or(0));
+    let lease = tokio::time::timeout(CALL_TIMEOUT, velo.get_into(staged.handle, &mut json))
+        .await
+        .with_context(|| format!("no reply in {CALL_TIMEOUT:?} reading a peer's listing"))?
+        .context("reading a peer's listing")?;
+    velo.release(staged.handle, lease).await?;
+    serde_json::from_slice(&json).context("parsing a peer's listing")
 }
 
 /// Have the node open a file of its export, and hold it open for us until we close it.

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use parking_lot::Mutex;
+use prometheus::{IntCounterVec, Opts, Registry};
 use tokio_util::sync::CancellationToken;
 use velo::InstanceId;
 
@@ -71,6 +72,20 @@ pub enum Via {
 pub struct Stalls {
     /// When reading a file of each, up as the instance, last stalled or tried RDMA again.
     since: Mutex<HashMap<NodeId, (InstanceId, Instant)>>,
+    counted: StallCount,
+}
+
+/// The reads of each node's files over RDMA that stalled.
+struct StallCount(IntCounterVec);
+
+impl Default for StallCount {
+    fn default() -> Self {
+        let opts = Opts::new(
+            "rview_fs_rdma_stalls_total",
+            "Reads of a machine's files over RDMA that stalled, by machine.",
+        );
+        Self(IntCounterVec::new(opts, &["node"]).expect("a valid metric"))
+    }
 }
 
 impl Stalls {
@@ -95,6 +110,7 @@ impl Stalls {
     /// Reading a file of `node`, up as `instance`, over RDMA stalled: whether that is
     /// news, which it is not when its files were read over TCP already.
     pub fn stalled(&self, node: &NodeId, instance: InstanceId) -> bool {
+        self.counted.0.with_label_values(&[node.as_str()]).inc();
         let was = self
             .since
             .lock()
@@ -105,6 +121,15 @@ impl Stalls {
     /// Reading a file of `node` over RDMA worked again.
     pub fn worked(&self, node: &NodeId) {
         self.since.lock().remove(node);
+    }
+
+    pub fn register(&self, registry: &Registry) -> prometheus::Result<()> {
+        registry.register(Box::new(self.counted.0.clone()))
+    }
+
+    /// The reads of `node`'s files over RDMA that stalled.
+    pub fn count(&self, node: &NodeId) -> u64 {
+        self.counted.0.with_label_values(&[node.as_str()]).get()
     }
 }
 

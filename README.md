@@ -142,7 +142,8 @@ TCP.
 With `--metrics`, any request there gets velo's metrics (`velo_*`), among them the bytes
 over TCP (`velo_transport_frame_bytes_total{transport="tcp"}`), and
 `rview_fs_read_bytes_total{path}`: the bytes of other machines' files read, by the path
-they moved on, `rdma` or `tcp`, which velo does not count.
+they moved on, `rdma` or `tcp`, which velo does not count; and
+`rview_fs_rdma_stalls_total{node}`: the reads of each machine's files over RDMA that stalled.
 
 ## Benchmarks
 

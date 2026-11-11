@@ -20,6 +20,7 @@ fn a_node_whose_rdma_stalled_is_read_over_tcp_and_later_over_rdma_by_one_read() 
     stalls.stalled(&b, first);
     assert_eq!(stalls.via(&b, second), Via::Rdma);
     assert!(stalls.stalled(&b, second));
+    assert_eq!(stalls.count(&b), 4); // every read that stalled
 }
 
 #[test]

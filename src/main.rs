@@ -263,6 +263,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
     let read_bytes = transfer::ReadBytes::default();
     read_bytes.register(&registry)?;
+    let stalls = Stalls::default();
+    stalls.register(&registry)?;
     let (velo, pinned) = build_velo(&args, metrics, &degraded).await?;
     let state = Arc::new(State {
         me,
@@ -273,7 +275,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         remote: RemoteFiles::default(),
         velo: velo.clone(),
         rdma: pinned,
-        stalls: Stalls::default(),
+        stalls,
         read_bytes,
     });
     let nats = async_nats::connect(&args.nats)

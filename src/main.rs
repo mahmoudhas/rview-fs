@@ -21,7 +21,7 @@ use rview_fs::health::{self, Degraded};
 use rview_fs::held::Held;
 use rview_fs::index::{Index, NodeId};
 use rview_fs::passthrough::Passthrough;
-use rview_fs::remote::RemoteFiles;
+use rview_fs::remote::{RemoteFiles, Stalls};
 use rview_fs::state::State;
 use rview_fs::{remote, sync, transfer};
 use tokio::signal::unix::{SignalKind, signal};
@@ -268,7 +268,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         remote: RemoteFiles::default(),
         velo: velo.clone(),
         rdma: pinned,
-        degraded: Arc::clone(&degraded),
+        stalls: Stalls::default(),
     });
     let nats = async_nats::connect(&args.nats)
         .await

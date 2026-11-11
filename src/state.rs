@@ -1,16 +1,15 @@
 //! What the FUSE file system and the NATS tasks share.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
+use anyhow::Context as _;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use velo::Velo;
 
 use crate::cache::ContentCache;
-use crate::health::Degraded;
 use crate::index::{Index, NodeId};
-use crate::remote::{Remote, RemoteFiles};
+use crate::remote::{Remote, RemoteFiles, Stalls, TCP_AFTER_STALL, Via};
 use crate::sync::Nodes;
 use crate::transfer;
 
@@ -29,7 +28,8 @@ pub struct State {
     pub velo: Velo,
     /// Files move between nodes over RDMA.
     pub rdma: bool,
-    pub degraded: Arc<Degraded>,
+    /// The nodes whose files are read over TCP for now.
+    pub stalls: Stalls,
 }
 
 impl State {
@@ -37,21 +37,52 @@ impl State {
     /// was read before.
     pub async fn remote_content(&self, remote: &Remote) -> anyhow::Result<Bytes> {
         self.cache
-            .get_or_fetch(&remote.key, || {
-                transfer::fetch(&self.velo, remote.instance, remote.handle)
-            })
+            .get_or_fetch(&remote.key, || self.fetch(remote))
             .await
-            .inspect_err(|e| {
-                if self.rdma && e.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) {
-                    self.degraded.report(
-                        "working RDMA",
-                        format!(
-                            "{e:#}: a transfer never completed, which is often UCX on the wrong \
-                             device: set UCX_NET_DEVICES to one port (mlx5_0:1, for one), or run \
-                             with --no-rdma"
-                        ),
+            .with_context(|| {
+                format!(
+                    "reading {} of {}",
+                    remote.key.path,
+                    remote.key.node.as_str()
+                )
+            })
+    }
+
+    /// A file another node holds open for us: over RDMA, unless reading one of its files
+    /// so stalled; then over TCP.
+    async fn fetch(&self, remote: &Remote) -> anyhow::Result<Bytes> {
+        let (node, instance, handle) = (&remote.key.node, remote.instance, remote.handle);
+        let via = if self.rdma {
+            self.stalls.via(node, instance)
+        } else {
+            Via::Tcp
+        };
+        if via == Via::Tcp {
+            return transfer::fetch(&self.velo, instance, handle, false).await;
+        }
+        match transfer::fetch(&self.velo, instance, handle, true).await {
+            Err(e) if e.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) => {
+                if self.stalls.stalled(node, instance) || via == Via::RdmaAgain {
+                    tracing::error!(
+                        node = node.as_str(),
+                        "{e:#}: reading the node's files over RDMA stalled, so they are read \
+                         over TCP, and over RDMA again in {TCP_AFTER_STALL:?}. UCX on the wrong \
+                         device stalls every one (set UCX_NET_DEVICES); UCX_LOG_LEVEL=diag says \
+                         what UCX saw"
                     );
                 }
-            })
+                transfer::fetch(&self.velo, instance, handle, false).await
+            }
+            fetched => {
+                if via == Via::RdmaAgain && fetched.is_ok() {
+                    self.stalls.worked(node);
+                    tracing::info!(
+                        node = node.as_str(),
+                        "reading the node's files over RDMA works again"
+                    );
+                }
+                fetched
+            }
+        }
     }
 }

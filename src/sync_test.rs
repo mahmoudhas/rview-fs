@@ -6,10 +6,10 @@ use velo::transports::tcp::TcpTransportBuilder;
 
 use super::*;
 use crate::cache::ContentCache;
-use crate::health::Degraded;
+use crate::cache::Key;
 use crate::held::Held;
 use crate::index::{Entry, EntryKind};
-use crate::remote::RemoteFiles;
+use crate::remote::{Remote, RemoteFile, RemoteFiles, Stalls};
 
 #[test]
 fn hidden_files_being_written_are_not_taken() {
@@ -72,7 +72,7 @@ fn state(velo: Velo) -> Arc<State> {
         remote: RemoteFiles::default(),
         velo,
         rdma: false,
-        degraded: Arc::new(Degraded::default()),
+        stalls: Stalls::default(),
     })
 }
 
@@ -86,6 +86,41 @@ fn export_of_one_file() -> tempfile::TempDir {
     let export = tempfile::tempdir().unwrap();
     std::fs::write(export.path().join("x.bin"), b"1234").unwrap();
     export
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_of_another_node_is_read_over_either_path_and_a_failed_read_says_whose() {
+    let export = export_of_one_file();
+    let (ours, theirs) = (velo().await, velo().await);
+    serve(&theirs, export.path());
+    ours.register_peer(theirs.peer_info()).unwrap();
+    let state = state(ours);
+    let b = NodeId::parse("b").unwrap();
+    state.nodes.write().heard(b.clone(), theirs.instance_id());
+    let key = |path| Key {
+        node: b.clone(),
+        path: RelPath::parse(path).unwrap(),
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let file = RemoteFile::open(Arc::clone(&state), key("x.bin"), runtime)
+        .await
+        .unwrap()
+        .unwrap();
+    for rdma in [true, false] {
+        let read = transfer::fetch(&state.velo, file.remote.instance, file.remote.handle, rdma);
+        assert_eq!(&read.await.unwrap()[..], b"1234");
+    }
+    assert_eq!(
+        &state.remote_content(&file.remote).await.unwrap()[..],
+        b"1234"
+    );
+    let unopened = Remote {
+        key: key("y.bin"),
+        handle: file.remote.handle + 1,
+        ..file.remote.clone()
+    };
+    let failed = format!("{:#}", state.remote_content(&unopened).await.unwrap_err());
+    assert!(failed.starts_with("reading y.bin of b: "), "{failed}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

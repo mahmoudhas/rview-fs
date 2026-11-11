@@ -35,6 +35,9 @@ pub const CLOSE: &str = "rview_close";
 pub const RENEW: &str = "rview_renew";
 /// How long a call waits for its answer: less than held::GRACE.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a file may take to move over RDMA, where one moves in milliseconds: one that
+/// takes longer has stalled.
+pub const RDMA_STALL: Duration = Duration::from_secs(10);
 // A stage nobody took by then is dropped; no transfer takes anywhere near as long.
 const STAGED_FOR: Duration = Duration::from_secs(600);
 const REAP_EVERY: Duration = Duration::from_secs(10);
@@ -73,6 +76,15 @@ pub struct Opened {
 struct HandleRequest {
     client: InstanceId,
     handle: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FetchRequest {
+    client: InstanceId,
+    handle: u64,
+    /// Staged in plain memory, to move over TCP, though this node has RDMA.
+    #[serde(default)]
+    over_tcp: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -303,14 +315,18 @@ pub fn serve(
     let (weak, fetched_from, staged_by): (WeakVelo, _, _) =
         (velo.downgrade(), Arc::clone(&held), Arc::clone(&stages));
     velo.register_handler(
-        Handler::typed_unary_async(FETCH, move |ctx: TypedContext<HandleRequest>| {
+        Handler::typed_unary_async(FETCH, move |ctx: TypedContext<FetchRequest>| {
             let (weak, held, stages) = (
                 weak.clone(),
                 Arc::clone(&fetched_from),
                 Arc::clone(&staged_by),
             );
             async move {
-                let HandleRequest { client, handle } = ctx.input;
+                let FetchRequest {
+                    client,
+                    handle,
+                    over_tcp,
+                } = ctx.input;
                 let file = held.get(client, handle, Instant::now()).ok_or_else(|| {
                     anyhow!(
                         "no file {handle} is open for that node: closed, or this node restarted"
@@ -318,7 +334,7 @@ pub fn serve(
                 })?;
                 let bytes = tokio::task::spawn_blocking(move || map_held(&file)).await??;
                 let velo = weak.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
-                stage(&velo, &stages, bytes, pinned).await
+                stage(&velo, &stages, bytes, pinned && !over_tcp).await
             }
         })
         .build(),
@@ -434,13 +450,20 @@ pub async fn open(
         .with_context(|| format!("opening {path}"))
 }
 
-/// The bytes of a file the node holds open for us as `handle`.
-pub async fn fetch(velo: &Velo, instance: InstanceId, handle: u64) -> anyhow::Result<Bytes> {
+/// The bytes of a file the node holds open for us as `handle`: over RDMA when `rdma` and
+/// the node has it, then within RDMA_STALL, else over TCP.
+pub async fn fetch(
+    velo: &Velo,
+    instance: InstanceId,
+    handle: u64,
+    rdma: bool,
+) -> anyhow::Result<Bytes> {
     let staged = velo
         .typed_unary::<Staged>(FETCH)?
-        .payload(&HandleRequest {
+        .payload(&FetchRequest {
             client: velo.instance_id(),
             handle,
+            over_tcp: !rdma,
         })?
         .instance(instance)
         .timeout(CALL_TIMEOUT)
@@ -451,9 +474,10 @@ pub async fn fetch(velo: &Velo, instance: InstanceId, handle: u64) -> anyhow::Re
     let mut dest: &mut [u8] = map.as_deref_mut().unwrap_or_default();
     // A node that hangs rather than goes would hold the read, and the page fault behind
     // it, forever.
-    let lease = tokio::time::timeout(CALL_TIMEOUT, velo.get_into(staged.handle, &mut dest))
+    let wait = if rdma { RDMA_STALL } else { CALL_TIMEOUT };
+    let lease = tokio::time::timeout(wait, velo.get_into(staged.handle, &mut dest))
         .await
-        .with_context(|| format!("no reply in {CALL_TIMEOUT:?} reading a staged file"))?
+        .with_context(|| format!("no reply in {wait:?} reading a staged file"))?
         .context("reading a staged file")?;
     velo.release(staged.handle, lease).await?;
     Ok(content::freeze(map)?)

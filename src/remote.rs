@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use parking_lot::Mutex;
@@ -13,6 +14,7 @@ use velo::InstanceId;
 
 use crate::cache::Key;
 use crate::held::RENEW_EVERY;
+use crate::index::NodeId;
 use crate::state::State;
 use crate::transfer::{self, Opened};
 
@@ -45,6 +47,64 @@ impl RemoteFiles {
             .iter()
             .map(|(instance, handles)| (*instance, handles.iter().copied().collect()))
             .collect()
+    }
+}
+
+/// How long a node's files are read over TCP after reading one over RDMA stalled, before
+/// a read tries RDMA again.
+pub const TCP_AFTER_STALL: Duration = Duration::from_secs(300);
+
+/// How a file of another node is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    Rdma,
+    /// RDMA, once the node's files were read over TCP for TCP_AFTER_STALL: whether it
+    /// works again.
+    RdmaAgain,
+    Tcp,
+}
+
+/// The nodes whose files are read over TCP, because reading one over RDMA stalled: RDMA
+/// from a node has stalled, with no error from UCX, until rview-fs restarted, while TCP
+/// went on working.
+#[derive(Default)]
+pub struct Stalls {
+    /// When reading a file of each, up as the instance, last stalled or tried RDMA again.
+    since: Mutex<HashMap<NodeId, (InstanceId, Instant)>>,
+}
+
+impl Stalls {
+    /// How to read a file of `node`, up as `instance`.
+    pub fn via(&self, node: &NodeId, instance: InstanceId) -> Via {
+        let mut since = self.since.lock();
+        let Some((stalled, at)) = since.get_mut(node) else {
+            return Via::Rdma;
+        };
+        if *stalled != instance {
+            since.remove(node); // it restarted, and its UCX with it
+            return Via::Rdma;
+        }
+        if at.elapsed() < TCP_AFTER_STALL {
+            return Via::Tcp;
+        }
+        // This read tries RDMA; the others go on over TCP until it worked.
+        *at = Instant::now();
+        Via::RdmaAgain
+    }
+
+    /// Reading a file of `node`, up as `instance`, over RDMA stalled: whether that is
+    /// news, which it is not when its files were read over TCP already.
+    pub fn stalled(&self, node: &NodeId, instance: InstanceId) -> bool {
+        let was = self
+            .since
+            .lock()
+            .insert(node.clone(), (instance, Instant::now()));
+        was.is_none_or(|(stalled, _)| stalled != instance)
+    }
+
+    /// Reading a file of `node` over RDMA worked again.
+    pub fn worked(&self, node: &NodeId) {
+        self.since.lock().remove(node);
     }
 }
 

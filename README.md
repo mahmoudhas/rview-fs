@@ -34,6 +34,10 @@ their files on [NATS](https://nats.io).
 - `--cache-gib` keeps other machines' files read before, which then open without asking
   their machine, least recently used first out; `--stage-gib` bounds what a machine stages
   for the others while they read its files.
+- A file moves over RDMA in milliseconds. One that has not within 10 s has stalled, and is
+  read over TCP instead, as are the files of its machine for the next 5 minutes; then one
+  read tries RDMA again. RDMA from a machine has stalled, with no error from UCX, until
+  rview-fs restarted, while TCP went on working.
 
 ### Files open on another machine
 
@@ -73,9 +77,10 @@ the other had already, not only those announced since.
 | RDMA | A build with `--features ucx` (the default), rdma-core's libraries, and an RDMA NIC; on RoCE, the host's network namespace, and with several NICs, UCX on one port: `UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self` | Files move between machines over TCP |
 
 What is missing is logged as an error, `DEGRADED: ... is not available: <why>`, when
-rview-fs finds it, and again every 10 minutes. So is a transfer over TCP while RDMA is on,
-and an RDMA transfer that never completes. `--no-passthrough` and `--no-rdma` do without
-them on purpose, and say nothing.
+rview-fs finds it, and again every 10 minutes. So is a transfer over TCP while RDMA is on.
+An RDMA transfer that stalls is logged as an error that names the machine, and so is each
+try of RDMA after. `--no-passthrough` and `--no-rdma` do without them on purpose, and say
+nothing.
 
 ## Exports
 
@@ -222,4 +227,8 @@ A build with RDMA runs with rdma-core's libraries: `libibverbs1`, `librdmacm1` a
   connection cleanly.
 - On a machine with several RDMA NICs, UCX left to choose devices on its own can make
   transfers between two rview-fs never complete: pin it to one port (`UCX_NET_DEVICES`).
-  rview-fs gives up on a transfer after 60 s and says so as `DEGRADED`.
+  Every RDMA transfer then stalls, and files move over TCP.
+- With several RDMA NICs in use, RDMA between two rview-fs has stalled after an idle
+  while, with no error, until rview-fs restarted. What UCX saw is logged only with
+  `UCX_LOG_LEVEL=diag` in rview-fs's environment: a port going down, an RDMA operation's
+  error and the device it was on, and a connection that stops answering.

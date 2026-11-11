@@ -130,6 +130,7 @@ UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self \
 | `--cache-gib` | Host memory for the files of other machines read before (16) |
 | `--stage-gib` | Host memory this machine stages its files in while the others read them (16); past it, they cannot read its files until stages are taken |
 | `--bind` | Where velo listens for the other machines (`0.0.0.0:0`) |
+| `--metrics` (`RVIEW_METRICS`) | Where to serve Prometheus metrics, such as `127.0.0.1:9300` (off) |
 | `--fuse-workers`, `--fuse-queue-depth` | Threads serving FUSE requests (8), and requests in flight per kernel queue (8) |
 | `--no-passthrough` | Serve the reads of this machine's files too |
 | `--no-rdma` | Move files between machines over TCP |
@@ -137,6 +138,11 @@ UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self \
 It needs root, or `CAP_SYS_ADMIN`, `/dev/fuse` and `fusermount3`. On SIGTERM it detaches
 the mount and exits. It logs how its transfers went: `rdma/ok`, or why a file moved over
 TCP.
+
+With `--metrics`, any request there gets velo's metrics (`velo_*`), among them the bytes
+over TCP (`velo_transport_frame_bytes_total{transport="tcp"}`), and
+`rview_fs_read_bytes_total{path}`: the bytes of other machines' files read, by the path
+they moved on, `rdma` or `tcp`, which velo does not count.
 
 ## Benchmarks
 

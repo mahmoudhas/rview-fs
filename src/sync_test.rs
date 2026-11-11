@@ -73,6 +73,7 @@ fn state(velo: Velo) -> Arc<State> {
         velo,
         rdma: false,
         stalls: Stalls::default(),
+        read_bytes: transfer::ReadBytes::default(),
     })
 }
 
@@ -107,9 +108,13 @@ async fn a_file_of_another_node_is_read_over_either_path_and_a_failed_read_says_
         .unwrap()
         .unwrap();
     for rdma in [true, false] {
-        let read = transfer::fetch(&state.velo, file.remote.instance, file.remote.handle, rdma);
+        let (instance, handle) = (file.remote.instance, file.remote.handle);
+        let read = transfer::fetch(&state.velo, instance, handle, rdma, &state.read_bytes);
         assert_eq!(&read.await.unwrap()[..], b"1234");
     }
+    // Without UCX, velo moves both in chunks over TCP.
+    let read = &state.read_bytes;
+    assert_eq!((read.get("rdma"), read.get("tcp")), (0, 8));
     assert_eq!(
         &state.remote_content(&file.remote).await.unwrap()[..],
         b"1234"

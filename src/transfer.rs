@@ -20,9 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, anyhow};
 use bytes::Bytes;
 use parking_lot::Mutex;
+use prometheus::{IntCounterVec, Opts, Registry};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-use velo::{DataHandle, Handler, InstanceId, TypedContext, Velo, WeakVelo};
+use velo::{
+    DataHandle, Handler, InstanceId, RdmaDestination, RendezvousWrite, TypedContext, Velo, WeakVelo,
+};
 
 use crate::content;
 use crate::held::Held;
@@ -450,6 +453,55 @@ pub async fn open(
         .with_context(|| format!("opening {path}"))
 }
 
+/// The bytes of other nodes' files read, by the path velo moved them on, which velo's own
+/// metrics do not count: `rdma`, or `tcp` (its chunks).
+#[derive(Clone)]
+pub struct ReadBytes(IntCounterVec);
+
+impl Default for ReadBytes {
+    fn default() -> Self {
+        let opts = Opts::new(
+            "rview_fs_read_bytes_total",
+            "Bytes of other machines' files read, by the path velo moved them on.",
+        );
+        Self(IntCounterVec::new(opts, &["path"]).expect("a valid metric"))
+    }
+}
+
+impl ReadBytes {
+    pub fn register(&self, registry: &Registry) -> prometheus::Result<()> {
+        registry.register(Box::new(self.0.clone()))
+    }
+
+    pub fn get(&self, path: &str) -> u64 {
+        self.0.with_label_values(&[path]).get()
+    }
+}
+
+/// A destination that notes whether velo moved its bytes over RDMA: velo asks for
+/// registered memory to read into only once it holds the owner's RDMA descriptor. A read
+/// whose RDMA read failed is read again in chunks, still noted as RDMA; velo counts
+/// those in velo_rendezvous_rdma_path_total{reason="get_failed"}.
+struct Noted<'a> {
+    dest: &'a mut [u8],
+    rdma: bool,
+}
+
+impl RendezvousWrite for Noted<'_> {
+    fn write_chunk(&mut self, offset: usize, data: &[u8]) -> anyhow::Result<()> {
+        self.dest.write_chunk(offset, data)
+    }
+
+    fn capacity(&self) -> usize {
+        self.dest.len()
+    }
+
+    fn rdma_destination(&mut self) -> Option<RdmaDestination<'_>> {
+        self.rdma = true;
+        None
+    }
+}
+
 /// The bytes of a file the node holds open for us as `handle`: over RDMA when `rdma` and
 /// the node has it, then within RDMA_STALL, else over TCP.
 pub async fn fetch(
@@ -457,6 +509,7 @@ pub async fn fetch(
     instance: InstanceId,
     handle: u64,
     rdma: bool,
+    read: &ReadBytes,
 ) -> anyhow::Result<Bytes> {
     let staged = velo
         .typed_unary::<Staged>(FETCH)?
@@ -471,7 +524,10 @@ pub async fn fetch(
         .await
         .context("staging an open file")?;
     let mut map = content::buffer(staged.size).context("making room for a file")?;
-    let mut dest: &mut [u8] = map.as_deref_mut().unwrap_or_default();
+    let mut dest = Noted {
+        dest: map.as_deref_mut().unwrap_or_default(),
+        rdma: false,
+    };
     // A node that hangs rather than goes would hold the read, and the page fault behind
     // it, forever.
     let wait = if rdma { RDMA_STALL } else { CALL_TIMEOUT };
@@ -479,6 +535,8 @@ pub async fn fetch(
         .await
         .with_context(|| format!("no reply in {wait:?} reading a staged file"))?
         .context("reading a staged file")?;
+    let path = if dest.rdma { "rdma" } else { "tcp" };
+    read.0.with_label_values(&[path]).inc_by(staged.size);
     velo.release(staged.handle, lease).await?;
     Ok(content::freeze(map)?)
 }

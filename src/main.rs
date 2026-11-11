@@ -23,7 +23,7 @@ use rview_fs::index::{Index, NodeId};
 use rview_fs::passthrough::Passthrough;
 use rview_fs::remote::{RemoteFiles, Stalls};
 use rview_fs::state::State;
-use rview_fs::{remote, sync, transfer};
+use rview_fs::{metrics, remote, sync, transfer};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -67,6 +67,9 @@ struct Args {
     /// Where velo listens for the other machines.
     #[arg(long, default_value = "0.0.0.0:0")]
     bind: SocketAddr,
+    /// Where to serve Prometheus metrics, velo's and rview-fs's own (off by default).
+    #[arg(long, env = "RVIEW_METRICS")]
+    metrics: Option<SocketAddr>,
     /// Threads that serve FUSE requests.
     #[arg(long, default_value_t = 8)]
     fuse_workers: usize,
@@ -258,6 +261,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let degraded = Arc::new(Degraded::default());
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
+    let read_bytes = transfer::ReadBytes::default();
+    read_bytes.register(&registry)?;
     let (velo, pinned) = build_velo(&args, metrics, &degraded).await?;
     let state = Arc::new(State {
         me,
@@ -269,6 +274,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         velo: velo.clone(),
         rdma: pinned,
         stalls: Stalls::default(),
+        read_bytes,
     });
     let nats = async_nats::connect(&args.nats)
         .await
@@ -297,6 +303,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     tasks.spawn(transfer::reap(velo.clone(), stages, held, cancel.clone()));
     tasks.spawn(remote::renew(Arc::clone(&state), cancel.clone()));
     tasks.spawn(sync::rescan(Arc::clone(&state), cancel.clone()));
+    if let Some(addr) = args.metrics {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding {addr} for metrics"))?;
+        tasks.spawn(metrics::serve(listener, registry.clone(), cancel.clone()));
+    }
     tasks.spawn(log_transfer_paths(
         registry,
         pinned,

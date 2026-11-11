@@ -13,6 +13,7 @@ pub mod fs;
 pub mod health;
 pub mod held;
 pub mod index;
+pub mod metrics;
 pub mod passthrough;
 pub mod path;
 pub mod remote;

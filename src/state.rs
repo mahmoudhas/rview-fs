@@ -30,6 +30,7 @@ pub struct State {
     pub rdma: bool,
     /// The nodes whose files are read over TCP for now.
     pub stalls: Stalls,
+    pub read_bytes: transfer::ReadBytes,
 }
 
 impl State {
@@ -58,9 +59,9 @@ impl State {
             Via::Tcp
         };
         if via == Via::Tcp {
-            return transfer::fetch(&self.velo, instance, handle, false).await;
+            return transfer::fetch(&self.velo, instance, handle, false, &self.read_bytes).await;
         }
-        match transfer::fetch(&self.velo, instance, handle, true).await {
+        match transfer::fetch(&self.velo, instance, handle, true, &self.read_bytes).await {
             Err(e) if e.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) => {
                 if self.stalls.stalled(node, instance) || via == Via::RdmaAgain {
                     tracing::error!(
@@ -71,7 +72,7 @@ impl State {
                          what UCX saw"
                     );
                 }
-                transfer::fetch(&self.velo, instance, handle, false).await
+                transfer::fetch(&self.velo, instance, handle, false, &self.read_bytes).await
             }
             fetched => {
                 if via == Via::RdmaAgain && fetched.is_ok() {

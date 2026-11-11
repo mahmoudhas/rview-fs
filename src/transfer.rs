@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,9 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 // A stage nobody took by then is dropped; no transfer takes anywhere near as long.
 const STAGED_FOR: Duration = Duration::from_secs(600);
 const REAP_EVERY: Duration = Duration::from_secs(10);
+// A held file is read in parts of at least this much, by up to READ_THREADS threads at once.
+const READ_PART: usize = 8 << 20;
+const READ_THREADS: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Listing {
@@ -158,16 +162,27 @@ pub fn open_export_file(root: &Path, path: &RelPath) -> io::Result<Option<(File,
     Ok(Some((file, meta.len())))
 }
 
-/// The bytes of a held file, mapped. Blocks.
-fn map_held(file: &File) -> io::Result<Bytes> {
-    if file.metadata()?.len() == 0 {
+/// The bytes of a held file, read whole: in parts by several threads, each in large reads
+/// the file system reads ahead of, not page by page as the faults of a mapping read it,
+/// several times slower. Blocks.
+fn read_held(file: &File) -> io::Result<Bytes> {
+    let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+    if len == 0 {
         return Ok(Bytes::new());
     }
-    // SAFETY: files are written under a hidden name and moved into place whole, and never
-    // written again (README.md), so the mapping never changes under us. It keeps the file
-    // after the file is closed and deleted, until the mapping is dropped.
-    let mapped = unsafe { memmap2::Mmap::map(file)? };
-    Ok(Bytes::from_owner(mapped))
+    let mut bytes = vec![0u8; len];
+    let part = len.div_ceil(len.div_ceil(READ_PART).min(READ_THREADS));
+    std::thread::scope(|threads| {
+        let reads: Vec<_> = bytes
+            .chunks_mut(part)
+            .zip((0..).step_by(part))
+            .map(|(chunk, offset)| threads.spawn(move || file.read_exact_at(chunk, offset as u64)))
+            .collect();
+        reads
+            .into_iter()
+            .try_for_each(|read| read.join().expect("a thread reading a held file panicked"))
+    })?;
+    Ok(Bytes::from(bytes))
 }
 
 /// What this node staged for other nodes: within `budget` bytes, oldest first.
@@ -304,7 +319,7 @@ pub fn serve(
                         "no file {handle} is open for that node: closed, or this node restarted"
                     )
                 })?;
-                let bytes = tokio::task::spawn_blocking(move || map_held(&file)).await??;
+                let bytes = tokio::task::spawn_blocking(move || read_held(&file)).await??;
                 let velo = weak.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
                 let size = bytes.len() as u64;
                 let store = velo.rendezvous_manager().data_store();

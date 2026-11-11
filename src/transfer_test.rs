@@ -85,3 +85,14 @@ fn files_deeper_than_a_path_takes_are_listed_and_opened() {
     let (_, size) = open_export_file(dir.path(), &path).unwrap().unwrap();
     assert_eq!(size, 4);
 }
+
+#[test]
+fn a_held_file_is_read_whole_in_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    for len in [0, 1, READ_PART - 1, 2 * READ_PART + 12_345] {
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let path = dir.path().join(format!("{len}.bin"));
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_held(&File::open(&path).unwrap()).unwrap(), bytes);
+    }
+}

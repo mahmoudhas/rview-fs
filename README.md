@@ -37,7 +37,7 @@ their files on [NATS](https://nats.io).
 - A file moves over RDMA in milliseconds. One that has not within 10 s has stalled, and is
   read over TCP instead, as are the files of its machine for the next 5 minutes; then one
   read tries RDMA again. RDMA from a machine has stalled, with no error from UCX, until
-  rview-fs restarted, while TCP went on working.
+  rview-fs restarted, while TCP went on working (see Known issues).
 
 ### Files open on another machine
 
@@ -74,7 +74,7 @@ the other had already, not only those announced since.
 | --- | --- | --- |
 | FUSE over io_uring | Linux 6.14 built with `CONFIG_FUSE_IO_URING` | rview-fs does not start: fractal-fuse has no other way. rview-fs turns the kernel's switch on (`/sys/module/fuse/parameters/enable_uring`) when it is off |
 | Passthrough | Linux 6.9 built with `CONFIG_FUSE_PASSTHROUGH`, `CAP_SYS_ADMIN`, and the export on a plain file system: not overlayfs | rview-fs serves the reads of this machine's files itself, several times slower. It serves the files of other machines either way |
-| RDMA | A build with `--features ucx` (the default), rdma-core's libraries, and an RDMA NIC; on RoCE, the host's network namespace, and with several NICs, UCX on one port: `UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self` | Files move between machines over TCP |
+| RDMA | A build with `--features ucx` (the default), rdma-core's libraries, and an RDMA NIC with DC (`dc_mlx5`); on RoCE, the host's network namespace, and with several NICs, UCX on one port: `UCX_NET_DEVICES=mlx5_0:1` | Files move between machines over TCP |
 
 What is missing is logged as an error, `DEGRADED: ... is not available: <why>`, when
 rview-fs finds it, and again every 10 minutes. So is a transfer over TCP while RDMA is on.
@@ -115,7 +115,7 @@ Two subjects under `--subject`:
 ## Running
 
 ```bash
-UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self \
+UCX_NET_DEVICES=mlx5_0:1 \
   rview-fs --export /data/export --mount /mnt/union --nats nats://nats:4222 \
   --subject myapp [--node-id $(hostname)]
 ```
@@ -157,7 +157,7 @@ the file in the export, and prints what rview-fs logged as a warning or an error
 ```bash
 cargo build --release
 python3 bench/bench.py            # files between the machines over TCP
-UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc_mlx5,ud_mlx5,self python3 bench/bench.py --rdma
+UCX_NET_DEVICES=mlx5_0:1 python3 bench/bench.py --rdma
 ```
 
 It needs `nats-server`, FUSE, and Python 3.10 or later; nothing outside its standard
@@ -239,3 +239,8 @@ A build with RDMA runs with rdma-core's libraries: `libibverbs1`, `librdmacm1` a
   while, with no error, until rview-fs restarted. What UCX saw is logged only with
   `UCX_LOG_LEVEL=diag` in rview-fs's environment: a port going down, an RDMA operation's
   error and the device it was on, and a connection that stops answering.
+- With UCX's default transports, RDMA from one machine stalled for good, on every new
+  endpoint to it too, after UCX's UD, which wires RC up and keeps it alive, timed out on
+  it (logged only at `UCX_LOG_LEVEL=debug`). Reads of the other machines' files over RDMA
+  went on, and so did TCP. So rview-fs has UCX wire RC up over DC instead, which keeps no
+  state for another machine: `UCX_TLS=rc_mlx5,dc_mlx5`, unless `UCX_TLS` is set.

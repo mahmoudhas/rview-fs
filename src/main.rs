@@ -190,7 +190,10 @@ async fn rdma_velo(args: &Args, metrics: Arc<VeloMetrics>) -> anyhow::Result<Vel
     use velo::RdmaConfig;
     use velo::transports::ucx::UcxTransportBuilder;
 
-    let ucx = Arc::new(UcxTransportBuilder::new().build()?);
+    // UCX wires RC up and keeps it alive over UD by default. UD's state for another
+    // machine has stalled every read of its files over RDMA, on new endpoints too, with no
+    // error, until rview-fs restarted. DC keeps no such state. UCX_TLS still wins.
+    let ucx = Arc::new(UcxTransportBuilder::new().tls("rc_mlx5,dc_mlx5").build()?);
     let staged = (args.stage_gib * f64::from(1u32 << 30)) as u64;
     let mut rdma = RdmaConfig::default();
     // A file being read is staged by copying it into registered memory. Pooled arenas

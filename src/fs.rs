@@ -13,6 +13,10 @@
 //! read and fault them in again, and that must not need the other node still up. A file
 //! read before comes from the cache, without asking its node.
 //!
+//! A folder is read from one listing of it, taken when the reading begins: the kernel
+//! reads a folder a page of entries a call, and each call returns the next entries of
+//! that listing (OpenDirs), so reading a folder costs its size once.
+//!
 //! The kernel serves an inode either through rview-fs, keeping what it read, or passed
 //! through, and fails an open of the one kind while one of the other is open (EIO). A
 //! file of this node is passed through and one of another served, but a file two nodes
@@ -61,6 +65,7 @@ pub struct RviewFs {
     // await.
     inodes: Mutex<Inodes>,
     open: Mutex<OpenFiles>,
+    dirs: Mutex<OpenDirs>,
 }
 
 /// The path of every inode the kernel holds, with how many lookups it holds it by.
@@ -140,6 +145,62 @@ struct OpenFiles {
     files: HashMap<u64, Arc<OpenFile>>,
     next: u64,
     kinds: Kinds,
+}
+
+/// A folder's entries, "." and ".." first, in the order they are read.
+type Listing = Vec<(String, EntryKind)>;
+
+/// The folders open, each with the listing its reading returns entries of.
+///
+/// The kernel reads a folder in calls of a page of entries, each from the offset the one
+/// before reached. A listing taken at every call costs the folder's size a call, the
+/// square of it a reading: seconds for tens of thousands of entries. So a reading takes
+/// one listing, when it begins, and its calls read on in it. The folder may change
+/// meanwhile, which that reading does not see; one begun again (rewinddir) does.
+#[derive(Default)]
+struct OpenDirs {
+    listings: HashMap<u64, Option<Arc<Listing>>>,
+    next: u64,
+}
+
+impl OpenDirs {
+    /// A handle for a folder opened, which has no listing until it is read.
+    fn open(&mut self) -> u64 {
+        self.next += 1;
+        self.listings.insert(self.next, None);
+        self.next
+    }
+
+    /// The listing the reading of `fh` that goes on at `offset` began with. None when a
+    /// reading begins (offset 0), which takes one, and for a handle with none to go on
+    /// in: one read first from further in, or not open here.
+    fn reading(&self, fh: u64, offset: u64) -> Option<Arc<Listing>> {
+        if offset == 0 {
+            return None;
+        }
+        self.listings.get(&fh)?.clone()
+    }
+
+    /// `listing` is what the reading of `fh` beginning now returns entries of. The
+    /// listing of the reading before it, for the caller to drop.
+    fn begin(&mut self, fh: u64, listing: &Arc<Listing>) -> Option<Arc<Listing>> {
+        self.listings.get_mut(&fh)?.replace(listing.clone())
+    }
+
+    /// The listing `fh` was read from, for the caller to drop.
+    fn close(&mut self, fh: u64) -> Option<Arc<Listing>> {
+        self.listings.remove(&fh)?
+    }
+}
+
+/// The entries of `listing` after its first `offset`, each with its own offset: the
+/// number of entries up to and with it, which the kernel reads on from.
+fn after(listing: &Listing, offset: u64) -> impl Iterator<Item = (u64, &(String, EntryKind))> {
+    listing
+        .iter()
+        .enumerate()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .map(|(i, entry)| (i as u64 + 1, entry))
 }
 
 /// How the kernel reads an inode.
@@ -229,6 +290,7 @@ impl RviewFs {
             passthrough,
             inodes: Mutex::new(Inodes::new()),
             open: Mutex::default(),
+            dirs: Mutex::default(),
         }
     }
 
@@ -238,6 +300,20 @@ impl RviewFs {
 
     fn entry(&self, path: &str) -> FsResult<Entry> {
         self.state.index.read().lookup(path).ok_or(ENOENT)
+    }
+
+    /// The listing a call reading the folder `path` through `fh` from `offset` returns
+    /// entries of: the one its reading began with, or one taken now.
+    fn listing(&self, path: &str, fh: FileHandleId, offset: u64) -> FsResult<Arc<Listing>> {
+        if let Some(listing) = self.dirs.lock().reading(fh.0, offset) {
+            return Ok(listing);
+        }
+        let entries = self.state.index.read().list(path).ok_or(ENOENT)?;
+        let listing = Arc::new(with_dots(entries));
+        // Freeing a big listing takes a while: not under the lock every folder read takes.
+        let before = self.dirs.lock().begin(fh.0, &listing);
+        drop(before);
+        Ok(listing)
     }
 
     /// Where the bytes of inode `ino`, `file`, come from: this node's disk when it has
@@ -517,7 +593,7 @@ impl Filesystem for RviewFs {
     async fn opendir(&self, _req: Request, inode: InodeId, _flags: u32) -> FsResult<ReplyOpen> {
         match self.entry(&self.path(inode)?)? {
             Entry::Dir => Ok(ReplyOpen {
-                fh: FileHandleId(0),
+                fh: FileHandleId(self.dirs.lock().open()),
                 flags: 0,
                 backing_id: 0,
             }),
@@ -529,67 +605,59 @@ impl Filesystem for RviewFs {
         &self,
         _req: Request,
         inode: InodeId,
-        _fh: FileHandleId,
+        fh: FileHandleId,
         offset: u64,
         size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
         let path = self.path(inode)?;
-        let entries = self.state.index.read().list(&path).ok_or(ENOENT)?;
+        let listing = self.listing(&path, fh, offset)?;
         let mut used = 0;
-        let mut out = Vec::new();
-        for (i, (name, kind)) in with_dots(entries).into_iter().enumerate() {
-            let next = i as u64 + 1;
-            if next <= offset {
-                continue;
-            }
-            used += fuse_dirent_size(name.len());
-            if used > size as usize {
-                break;
-            }
-            out.push(DirectoryEntry {
+        Ok(after(&listing, offset)
+            .take_while(|(_, (name, _))| {
+                used += fuse_dirent_size(name.len());
+                used <= size as usize
+            })
+            .map(|(next, (name, kind))| DirectoryEntry {
                 // The kernel looks every name up before it uses it, so this only has to be
                 // a number other than zero; the same one for the same path.
-                ino: pseudo_ino(&join(&path, &name)),
+                ino: pseudo_ino(&join(&path, name)),
                 offset: next,
-                kind: file_type(kind),
-                name: name.into_bytes(),
-            });
-        }
-        Ok(out)
+                kind: file_type(*kind),
+                name: name.clone().into_bytes(),
+            })
+            .collect())
     }
 
     async fn readdirplus(
         &self,
         _req: Request,
         inode: InodeId,
-        _fh: FileHandleId,
+        fh: FileHandleId,
         offset: u64,
         size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
         let path = self.path(inode)?;
-        let entries = self.state.index.read().list(&path).ok_or(ENOENT)?;
+        let listing = self.listing(&path, fh, offset)?;
         let mut used = 0;
         let mut out = Vec::new();
-        for (i, (name, kind)) in with_dots(entries).into_iter().enumerate() {
-            let next = i as u64 + 1;
-            if next <= offset {
-                continue;
-            }
-            used += fuse_direntplus_size(name.len());
-            // Every entry handed back counts as a lookup, so only those that fit.
-            if used > size as usize {
-                break;
-            }
+        for (next, (name, _)) in after(&listing, offset) {
             let child = match name.as_str() {
                 "." => path.clone(),
                 ".." => path
                     .rsplit_once('/')
                     .map_or_else(String::new, |(p, _)| p.to_owned()),
-                _ => join(&path, &name),
+                _ => join(&path, name),
             };
+            // Gone since the listing: left out, and the call goes on to the entries after
+            // it, since one that returns none ends the reading.
             let Some(entry) = self.state.index.read().lookup(&child) else {
-                continue; // gone since the listing
+                continue;
             };
+            used += fuse_direntplus_size(name.len());
+            // Every entry handed back counts as a lookup, so only those that fit.
+            if used > size as usize {
+                break;
+            }
             let ino = if name == "." || name == ".." {
                 self.inodes
                     .lock()
@@ -603,8 +671,8 @@ impl Filesystem for RviewFs {
             out.push(DirectoryEntryPlus {
                 ino,
                 offset: next,
-                kind: file_type(kind),
-                name: name.into_bytes(),
+                kind: file_type(kind_of(&entry)),
+                name: name.clone().into_bytes(),
                 entry_ttl: TTL,
                 attr: attr(ino, &entry),
                 generation: 0,
@@ -617,9 +685,11 @@ impl Filesystem for RviewFs {
         &self,
         _req: Request,
         _inode: InodeId,
-        _fh: FileHandleId,
+        fh: FileHandleId,
         _flags: u32,
     ) -> FsResult<()> {
+        let listing = self.dirs.lock().close(fh.0);
+        drop(listing); // not under the lock, as in `listing`
         Ok(())
     }
 
@@ -655,6 +725,13 @@ fn with_dots(entries: Vec<(String, EntryKind)>) -> Vec<(String, EntryKind)> {
 fn pseudo_ino(path: &str) -> u64 {
     use std::hash::{BuildHasher as _, BuildHasherDefault, DefaultHasher};
     BuildHasherDefault::<DefaultHasher>::default().hash_one(path) | 1
+}
+
+fn kind_of(entry: &Entry) -> EntryKind {
+    match entry {
+        Entry::Dir => EntryKind::Dir,
+        Entry::File(_) => EntryKind::File,
+    }
 }
 
 fn file_type(kind: EntryKind) -> FileType {

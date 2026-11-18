@@ -168,14 +168,16 @@ The results below are medians of 3 runs on one machine with Linux 6.14 (an OCI G
 256 CPUs), its exports on the machine's NVMe RAID (ext4); 8 files of 64 MiB in each set,
 2000 files of 4 KiB, and 8 readers in the parallel stages. Files moved between the two
 rview-fs over RDMA (one RoCE port, `mlx5_0`, looped back to itself): every one of them
-`rdma/ok` but a 4 KiB file below RDMA's minimum. Without passthrough and with:
+`rdma/ok` but a 4 KiB file below RDMA's minimum. The listing of a folder is of later runs,
+on such a machine with files over TCP, which a listing moves none of. Without passthrough
+and with:
 
 | stage | MB/op | p50 ms, without | p50 ms, with | GB/s, without | GB/s, with |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | announced file shown by another machine | – | 0.0468 | 0.048 | – | – |
 | stat, first (another machine's 2000 small files) | – | 0.0303 | 0.0316 | – | – |
 | stat, again (another machine's 2000 small files) | – | 0.00611 | 0.00627 | – | – |
-| list a folder of 2000 files | – | 3.51 | 3.57 | – | – |
+| list a folder of 2000 files | – | 1.37 | 1.28 | – | – |
 | open, local disk, not rview-fs | – | 0.00679 | 0.00662 | – | – |
 | open, this machine's file | – | 0.0554 | 0.0641 | – | – |
 | open, another machine's 64 MiB file, not read yet | – | 0.234 | 0.202 | – | – |
@@ -202,7 +204,9 @@ What it shows:
 
 - **Metadata:** a file another machine announces shows up about 50 µs later. A `stat`
   takes about 30 µs the first time and 6 µs while the kernel keeps the answer (1 s).
-  Listing a folder of 2000 files takes 3.5 ms.
+  Listing a folder of 2000 files takes 1.3 ms, and one of 24,000 (`--small 24000`) 15 ms:
+  the kernel reads a folder a page of names a call, and every call reads on in one listing
+  of it, taken when the reading begins.
 - **This machine's files, passed through,** read as fast as the disk read directly: 2.3
   GB/s cold for one reader, 14 GB/s for 8, and a random 4 KiB read in 67 µs. Served by
   rview-fs instead, they read at 1 GB/s, 3.8 GB/s for 8 readers, and 112 µs.

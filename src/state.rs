@@ -87,3 +87,51 @@ impl State {
         }
     }
 }
+
+/// A node as the tests of more than one module build it.
+#[cfg(test)]
+pub mod testing {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use parking_lot::RwLock;
+    use velo::Velo;
+    use velo::transports::tcp::TcpTransportBuilder;
+
+    use super::State;
+    use crate::cache::ContentCache;
+    use crate::index::{Index, NodeId};
+    use crate::remote::{RemoteFiles, Stalls};
+    use crate::transfer;
+
+    /// A node's velo, over TCP on this host.
+    pub async fn velo() -> Velo {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .build()
+            .unwrap();
+        Velo::builder()
+            .add_transport(Arc::new(tcp))
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// What this node knows, which reaches the others with `velo`.
+    pub fn state(velo: Velo) -> Arc<State> {
+        Arc::new(State {
+            me: NodeId::parse("a").unwrap(),
+            export: PathBuf::from("/nonexistent"),
+            index: RwLock::new(Index::new()),
+            nodes: RwLock::default(),
+            cache: ContentCache::new(0),
+            remote: RemoteFiles::default(),
+            velo,
+            rdma: false,
+            stalls: Stalls::default(),
+            read_bytes: transfer::ReadBytes::default(),
+        })
+    }
+}

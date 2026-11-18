@@ -1,15 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use parking_lot::RwLock;
 use velo::Velo;
-use velo::transports::tcp::TcpTransportBuilder;
 
 use super::*;
-use crate::cache::ContentCache;
 use crate::cache::Key;
 use crate::held::Held;
 use crate::index::{Entry, EntryKind};
-use crate::remote::{Remote, RemoteFile, RemoteFiles, Stalls};
+use crate::remote::{Remote, RemoteFile};
+use crate::state::testing::{state, velo};
 
 #[test]
 fn hidden_files_being_written_are_not_taken() {
@@ -44,37 +42,6 @@ fn a_heartbeat_tells_whether_its_node_is_new_restarted_or_known() {
     assert_eq!(nodes.instance(&b), Some(second));
     nodes.forget(&b);
     assert_eq!(nodes.heard(b, second), Heard::New); // back after it went
-}
-
-/// A node's velo, over TCP on this host.
-async fn velo() -> Velo {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let tcp = TcpTransportBuilder::new()
-        .from_listener(listener)
-        .unwrap()
-        .build()
-        .unwrap();
-    Velo::builder()
-        .add_transport(Arc::new(tcp))
-        .build()
-        .await
-        .unwrap()
-}
-
-/// What this node knows, which reaches the others with `velo`.
-fn state(velo: Velo) -> Arc<State> {
-    Arc::new(State {
-        me: NodeId::parse("a").unwrap(),
-        export: PathBuf::from("/nonexistent"),
-        index: RwLock::new(Index::new()),
-        nodes: RwLock::default(),
-        cache: ContentCache::new(0),
-        remote: RemoteFiles::default(),
-        velo,
-        rdma: false,
-        stalls: Stalls::default(),
-        read_bytes: transfer::ReadBytes::default(),
-    })
 }
 
 /// Serve the export at `root` with `velo`, as another node's rview-fs does.

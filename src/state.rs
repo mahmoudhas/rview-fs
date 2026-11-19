@@ -31,6 +31,7 @@ pub struct State {
     /// The nodes whose files are read over TCP for now.
     pub stalls: Stalls,
     pub read_bytes: transfer::ReadBytes,
+    pub ops: transfer::OpTimes,
 }
 
 impl State {
@@ -132,6 +133,7 @@ pub mod testing {
             rdma: false,
             stalls: Stalls::default(),
             read_bytes: transfer::ReadBytes::default(),
+            ops: transfer::OpTimes::default(),
         })
     }
 }

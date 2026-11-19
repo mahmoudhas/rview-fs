@@ -151,6 +151,10 @@ over TCP (`velo_transport_frame_bytes_total{transport="tcp"}`), and
 `rview_fs_read_bytes_total{path}`: the bytes of other machines' files read, by the path
 they moved on, `rdma` or `tcp`, which velo does not count; and
 `rview_fs_rdma_stalls_total{node}`: the reads of each machine's files over RDMA that stalled.
+`rview_fs_op_duration_seconds{op}`: how long rview-fs took to answer each of the kernel's
+calls (`lookup`, `getattr`, `open`, `read`, `opendir`, `readdir`, `readdirplus`), those
+that failed too. A file passed through is read by the kernel itself and counts no `read`;
+the read that fetches another machine's file takes as long as the fetch.
 
 ## Benchmarks
 

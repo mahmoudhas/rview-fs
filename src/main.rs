@@ -266,6 +266,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
     let read_bytes = transfer::ReadBytes::default();
     read_bytes.register(&registry)?;
+    let ops = transfer::OpTimes::default();
+    ops.register(&registry)?;
     let stalls = Stalls::default();
     stalls.register(&registry)?;
     let (velo, pinned) = build_velo(&args, metrics, &degraded).await?;
@@ -280,6 +282,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         rdma: pinned,
         stalls,
         read_bytes,
+        ops,
     });
     let nats = async_nats::connect(&args.nats)
         .await

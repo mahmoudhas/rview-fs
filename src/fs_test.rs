@@ -216,3 +216,21 @@ async fn a_folder_first_read_from_further_in_is_read_from_a_listing_taken_then()
     assert_eq!(fs.dirs.lock().listings.len(), 1);
     assert!(fs.dirs.lock().listings.values().all(Option::is_some));
 }
+
+#[tokio::test]
+async fn each_call_of_the_kernel_is_timed_by_its_name() {
+    let (state, fs) = union_of(&["a.bin".to_owned()]).await;
+    assert_eq!(state.ops.count("lookup"), 0);
+    fs.lookup(REQUEST, ROOT, OsStr::new("a.bin")).await.unwrap();
+    assert_eq!(
+        fs.lookup(REQUEST, ROOT, OsStr::new("b.bin")).await.err(),
+        Some(ENOENT)
+    );
+    let fh = open_root(&fs).await;
+    fs.readdir(REQUEST, ROOT, fh, 0, 4096).await.unwrap();
+    // One that fails is timed too: a lookup of a name that is not there waits as long.
+    assert_eq!(state.ops.count("lookup"), 2);
+    assert_eq!(state.ops.count("opendir"), 1);
+    assert_eq!(state.ops.count("readdir"), 1);
+    assert_eq!(state.ops.count("read"), 0);
+}

@@ -482,6 +482,7 @@ impl RviewFs {
 
 impl Filesystem for RviewFs {
     async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
+        let _timed = self.state.ops.time("lookup");
         let name = name.to_str().ok_or(ENOENT)?;
         let path = join(&self.path(parent)?, name);
         let entry = self.entry(&path)?;
@@ -504,6 +505,7 @@ impl Filesystem for RviewFs {
         _fh: Option<FileHandleId>,
         _flags: u32,
     ) -> FsResult<ReplyAttr> {
+        let _timed = self.state.ops.time("getattr");
         let entry = self.entry(&self.path(inode)?)?;
         Ok(ReplyAttr {
             ttl: TTL,
@@ -512,6 +514,7 @@ impl Filesystem for RviewFs {
     }
 
     async fn open(&self, _req: Request, inode: InodeId, flags: u32) -> FsResult<ReplyOpen> {
+        let _timed = self.state.ops.time("open");
         if flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32 {
             return Err(libc::EROFS);
         }
@@ -543,6 +546,7 @@ impl Filesystem for RviewFs {
         offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
+        let _timed = self.state.ops.time("read");
         let file = self
             .open
             .lock()
@@ -591,6 +595,7 @@ impl Filesystem for RviewFs {
     }
 
     async fn opendir(&self, _req: Request, inode: InodeId, _flags: u32) -> FsResult<ReplyOpen> {
+        let _timed = self.state.ops.time("opendir");
         match self.entry(&self.path(inode)?)? {
             Entry::Dir => Ok(ReplyOpen {
                 fh: FileHandleId(self.dirs.lock().open()),
@@ -609,6 +614,7 @@ impl Filesystem for RviewFs {
         offset: u64,
         size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
+        let _timed = self.state.ops.time("readdir");
         let path = self.path(inode)?;
         let listing = self.listing(&path, fh, offset)?;
         let mut used = 0;
@@ -636,6 +642,7 @@ impl Filesystem for RviewFs {
         offset: u64,
         size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
+        let _timed = self.state.ops.time("readdirplus");
         let path = self.path(inode)?;
         let listing = self.listing(&path, fh, offset)?;
         let mut used = 0;

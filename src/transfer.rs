@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, anyhow};
 use bytes::Bytes;
 use parking_lot::Mutex;
-use prometheus::{IntCounterVec, Opts, Registry};
+use prometheus::{HistogramOpts, HistogramTimer, HistogramVec, IntCounterVec, Opts, Registry};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use velo::{
@@ -475,6 +475,38 @@ impl ReadBytes {
 
     pub fn get(&self, path: &str) -> u64 {
         self.0.with_label_values(&[path]).get()
+    }
+}
+
+/// How long rview-fs took to answer the kernel's calls, by call. A file passed through is
+/// read by the kernel itself, which no read here counts; the read that fetches another
+/// machine's file takes as long as the fetch.
+pub struct OpTimes(HistogramVec);
+
+impl Default for OpTimes {
+    fn default() -> Self {
+        let opts = HistogramOpts::new(
+            "rview_fs_op_duration_seconds",
+            "How long rview-fs took to answer the kernel's calls, by call.",
+        )
+        // 0.1 ms to 26 s, each four times the one before.
+        .buckets(prometheus::exponential_buckets(0.0001, 4.0, 10).expect("valid buckets"));
+        Self(HistogramVec::new(opts, &["op"]).expect("a valid metric"))
+    }
+}
+
+impl OpTimes {
+    pub fn register(&self, registry: &Registry) -> prometheus::Result<()> {
+        registry.register(Box::new(self.0.clone()))
+    }
+
+    /// Times the call `op` until what it returns is dropped.
+    pub fn time(&self, op: &str) -> HistogramTimer {
+        self.0.with_label_values(&[op]).start_timer()
+    }
+
+    pub fn count(&self, op: &str) -> u64 {
+        self.0.with_label_values(&[op]).get_sample_count()
     }
 }
 

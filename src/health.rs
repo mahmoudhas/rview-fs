@@ -45,13 +45,16 @@ impl Degraded {
 }
 
 /// The transfers that went over TCP although RDMA was on, from velo's counts of
-/// transfers by path (`rdma/ok`, or `chunked/` and the reason). Files too small for
-/// RDMA (`chunked/below_min`) always go over TCP.
+/// transfers by path (`rdma/ok`, or `chunked/` and the reason). Not those meant to: files
+/// too small for RDMA (`chunked/below_min`), and what we staged in plain memory
+/// (`chunked/not_pinned`), which is every listing, and the files of a node whose reads
+/// over RDMA stalled, which is said when it does.
 pub fn tcp_fallbacks(paths: &[(String, u64)]) -> Vec<(String, u64)> {
+    const MEANT: [&str; 2] = ["chunked/below_min", "chunked/not_pinned"];
     paths
         .iter()
         .filter(|(path, count)| {
-            *count > 0 && path.starts_with("chunked/") && path != "chunked/below_min"
+            *count > 0 && path.starts_with("chunked/") && !MEANT.contains(&path.as_str())
         })
         .cloned()
         .collect()

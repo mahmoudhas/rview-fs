@@ -13,11 +13,14 @@ fn only_files_rdma_could_have_moved_count_as_falling_back() {
         ("chunked/no_offer", 0),
         ("chunked/not_pinned", 1),
     ]);
-    assert_eq!(
-        tcp_fallbacks(&seen),
-        paths(&[("chunked/budget", 2), ("chunked/not_pinned", 1)])
-    );
-    assert!(tcp_fallbacks(&paths(&[("rdma/ok", 9), ("chunked/below_min", 1)])).is_empty());
+    assert_eq!(tcp_fallbacks(&seen), paths(&[("chunked/budget", 2)]));
+    // A listing is staged in plain memory, as a file read over TCP after a stall is.
+    let meant = paths(&[
+        ("rdma/ok", 9),
+        ("chunked/below_min", 1),
+        ("chunked/not_pinned", 4),
+    ]);
+    assert!(tcp_fallbacks(&meant).is_empty());
 }
 
 #[test]

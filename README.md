@@ -67,6 +67,11 @@ the other had already, not only those announced since.
   files of a machine gone.
 - A machine that heartbeats an address velo cannot use is left out, and said so at each
   heartbeat, until it heartbeats one velo can.
+- A listing goes into what rview-fs knows a part at a time, 2000 files at once: every
+  lookup waits while that is changed, about a millisecond a part. Put in whole, the
+  listing of a machine with 170,000 files held up every lookup for 0.6 s, at each
+  machine's listing, every ten minutes. What the machine announces between two parts
+  stands.
 
 ## What it needs, and what happens without
 
@@ -77,7 +82,9 @@ the other had already, not only those announced since.
 | RDMA | A build with `--features ucx` (the default), rdma-core's libraries, and an RDMA NIC with DC (`dc_mlx5`); on RoCE, the host's network namespace, and with several NICs, UCX on one port: `UCX_NET_DEVICES=mlx5_0:1` | Files move between machines over TCP |
 
 What is missing is logged as an error, `DEGRADED: ... is not available: <why>`, when
-rview-fs finds it, and again every 10 minutes. So is a transfer over TCP while RDMA is on.
+rview-fs finds it, and again every 10 minutes. So is a transfer over TCP while RDMA is on,
+but for those meant to go so: a file under RDMA's minimum, a listing, and the files of a
+machine whose reads over RDMA stalled.
 An RDMA transfer that stalls is logged as an error that names the machine, and so is each
 try of RDMA after. `--no-passthrough` and `--no-rdma` do without them on purpose, and say
 nothing.

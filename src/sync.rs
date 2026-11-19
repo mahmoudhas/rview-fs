@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
+use parking_lot::RwLockWriteGuard;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use velo::{InstanceId, PeerInfo};
 
-use crate::index::{Index, NodeId, Stat};
+use crate::index::{Index, NodeId, Replacement, Stat};
 use crate::path::RelPath;
 use crate::state::State;
 use crate::transfer;
@@ -30,6 +31,9 @@ const RESCAN_EVERY: Duration = Duration::from_secs(600);
 /// and twice as long after each time since, up to LIST_AGAIN_MOST.
 const LIST_AGAIN_AFTER: Duration = Duration::from_secs(1);
 const LIST_AGAIN_MOST: Duration = Duration::from_secs(30);
+/// The files of a listing looked at each time the index is taken to put it in: about a
+/// millisecond's worth.
+const LISTING_PART: usize = 2000;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Heartbeat {
@@ -277,12 +281,21 @@ pub async fn scan_local(state: &State) -> anyhow::Result<()> {
     let listing = tokio::task::spawn_blocking(move || transfer::scan(&root)).await??;
     let files = parse_listing(listing.files);
     let count = files.len();
-    state
-        .index
-        .write()
-        .replace_node(&state.me, files, listing.listed_at, requested);
+    let mut replacement = Replacement::new(&state.me, files, listing.listed_at, requested);
+    while replace_part(state.index.write(), &mut replacement) {
+        tokio::task::yield_now().await;
+    }
     tracing::info!(count, elapsed = ?started.elapsed(), "scanned the export");
     Ok(())
+}
+
+/// The next part of a listing into the index, which is held for no more than that: every
+/// lookup waits for whoever holds it, and for a node's whole listing (170,000 files) that
+/// was 0.6 s. Whoever waited has it next. False once the listing is in.
+fn replace_part(mut index: RwLockWriteGuard<'_, Index>, replacement: &mut Replacement) -> bool {
+    let more = index.replace_part(replacement, LISTING_PART);
+    RwLockWriteGuard::unlock_fair(index);
+    more
 }
 
 /// List a node that came up, as `instance`, until it answers: until then, of the files it
@@ -311,21 +324,25 @@ async fn list_node(state: &State, node: &NodeId, instance: InstanceId) -> anyhow
     let listing = transfer::list(&state.velo, instance).await?;
     let files = parse_listing(listing.files);
     let count = files.len();
-    {
-        // Held while the files go in, so that the node does not expire in between and
-        // leave them behind.
-        let nodes = state.nodes.read();
-        if nodes.instance(node) != Some(instance) {
-            tracing::info!(
-                node = node.as_str(),
-                "dropped the listing of a node that went or restarted since"
-            );
-            return Ok(());
+    let mut replacement = Replacement::new(node, files, listing.listed_at, requested);
+    loop {
+        {
+            // Held while a part of the files goes in, so that the node does not expire
+            // in between and leave them behind; one that expired between two parts took
+            // the parts before with it.
+            let nodes = state.nodes.read();
+            if nodes.instance(node) != Some(instance) {
+                tracing::info!(
+                    node = node.as_str(),
+                    "dropped the listing of a node that went or restarted since"
+                );
+                return Ok(());
+            }
+            if !replace_part(state.index.write(), &mut replacement) {
+                break;
+            }
         }
-        state
-            .index
-            .write()
-            .replace_node(node, files, listing.listed_at, requested);
+        tokio::task::yield_now().await;
     }
     tracing::info!(node = node.as_str(), count, "listed a node's files");
     Ok(())

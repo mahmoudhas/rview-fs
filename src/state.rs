@@ -12,6 +12,7 @@ use crate::index::{Index, NodeId};
 use crate::remote::{Remote, RemoteFiles, Stalls, TCP_AFTER_STALL, Via};
 use crate::sync::Nodes;
 use crate::transfer;
+use crate::used::Used;
 
 pub struct State {
     pub me: NodeId,
@@ -25,6 +26,8 @@ pub struct State {
     pub cache: ContentCache<Bytes>,
     /// The files of other nodes this node has open.
     pub remote: RemoteFiles,
+    /// The files of other nodes opened from `cache`, which their nodes are yet to be told.
+    pub used: Used,
     pub velo: Velo,
     /// Files move between nodes over RDMA.
     pub rdma: bool,
@@ -104,6 +107,7 @@ pub mod testing {
     use crate::index::{Index, NodeId};
     use crate::remote::{RemoteFiles, Stalls};
     use crate::transfer;
+    use crate::used::Used;
 
     /// A node's velo, over TCP on this host.
     pub async fn velo() -> Velo {
@@ -122,13 +126,20 @@ pub mod testing {
 
     /// What this node knows, which reaches the others with `velo`.
     pub fn state(velo: Velo) -> Arc<State> {
+        state_of(velo, PathBuf::from("/nonexistent"), 0)
+    }
+
+    /// The same, of a node that exports `export` and keeps `cache` bytes of other nodes'
+    /// files.
+    pub fn state_of(velo: Velo, export: PathBuf, cache: u64) -> Arc<State> {
         Arc::new(State {
             me: NodeId::parse("a").unwrap(),
-            export: PathBuf::from("/nonexistent"),
+            export,
             index: RwLock::new(Index::new()),
             nodes: RwLock::default(),
-            cache: ContentCache::new(0),
+            cache: ContentCache::new(cache),
             remote: RemoteFiles::default(),
+            used: Used::default(),
             velo,
             rdma: false,
             stalls: Stalls::default(),

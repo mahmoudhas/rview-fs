@@ -24,6 +24,8 @@
 //! of the kind of those still open (Kinds), served from this node's disk, or passed
 //! through to the backing file of the others even once deleted here.
 //!
+//! Every open counts as a use of the file on the node whose export holds it (used.rs).
+//!
 //! FUSE requests run on fractal-fuse's threads. Anything that blocks or talks to velo
 //! runs on the tokio runtime, and the request awaits it.
 
@@ -53,6 +55,7 @@ use crate::passthrough::Passthrough;
 use crate::path::join;
 use crate::remote::RemoteFile;
 use crate::state::State;
+use crate::used;
 
 // Files never change once written, but they come and go.
 const TTL: Duration = Duration::from_secs(1);
@@ -344,6 +347,9 @@ impl RviewFs {
             return Err(EIO);
         };
         if let Some(id) = passthrough.reuse(ino) {
+            if passthrough.mark_due(ino) {
+                self.mark_local(file);
+            }
             let source = Source::Passthrough { ino, id };
             return Ok(OpenFile { ino, size, source });
         }
@@ -369,12 +375,19 @@ impl RviewFs {
         }
     }
 
-    /// This node's file, or None when it is gone.
+    /// This node's file, or None when it is gone. Opened through the mount, it counts as
+    /// used (used.rs).
     async fn open_local(&self, file: &FileView) -> FsResult<Option<File>> {
         let (export, path) = (self.state.export.clone(), file.path.clone());
         match self
             .runtime
-            .spawn_blocking(move || crate::path::open_file(&export, &path))
+            .spawn_blocking(move || -> io::Result<File> {
+                let local = crate::path::open_file(&export, &path)?;
+                if let Err(e) = used::mark(&local) {
+                    used::cannot_mark(&e);
+                }
+                Ok(local)
+            })
             .await
         {
             Ok(Ok(local)) => Ok(Some(local)),
@@ -382,6 +395,17 @@ impl RviewFs {
             Ok(Err(e)) => Err(io_errno(&e)),
             Err(_) => Err(EIO),
         }
+    }
+
+    /// Mark this node's file as used, for an open that opens nothing of the export. The
+    /// open does not wait for it.
+    fn mark_local(&self, file: &FileView) {
+        let (export, path) = (self.state.export.clone(), file.path.clone());
+        self.runtime.spawn_blocking(move || {
+            if let Err(e) = used::mark_export_file(&export, &path) {
+                used::cannot_mark(&e);
+            }
+        });
     }
 
     /// An open rview-fs serves: from this node's disk when `ours`, else another node's.
@@ -398,6 +422,8 @@ impl RviewFs {
                 path: file.path.clone(),
             };
             if let Some(bytes) = self.state.cache.get(&key) {
+                // Its node is not asked, and is told of the open later (used.rs).
+                self.state.used.note(&key);
                 let size = bytes.len() as u64;
                 return Ok(OpenFile {
                     ino,

@@ -1,7 +1,10 @@
 use super::*;
+use crate::cache::Key;
+use crate::index::NodeId;
 use crate::index::Stat;
 use crate::path::RelPath;
-use crate::state::testing::{state, velo};
+use crate::state::testing::{state, state_of, velo};
+use crate::used::tests::{age, is_marked};
 
 const REQUEST: Request = Request {
     unique: 0,
@@ -233,4 +236,53 @@ async fn each_call_of_the_kernel_is_timed_by_its_name() {
     assert_eq!(state.ops.count("opendir"), 1);
     assert_eq!(state.ops.count("readdir"), 1);
     assert_eq!(state.ops.count("read"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_file_of_this_node_marks_it_used() {
+    let export = tempfile::tempdir().unwrap();
+    let path = export.path().join("a.bin");
+    std::fs::write(&path, b"1234").unwrap();
+    age(&path);
+    let state = state_of(velo().await, export.path().to_owned(), 0);
+    add(&state, "a.bin");
+    let fs = RviewFs::new(Arc::clone(&state), tokio::runtime::Handle::current(), None);
+    let found = fs.lookup(REQUEST, ROOT, OsStr::new("a.bin")).await.unwrap();
+    let inode = InodeId(found.attr.ino);
+    assert!(!is_marked(&path), "looked up, not opened");
+    let opened = fs.open(REQUEST, inode, libc::O_RDONLY as u32).await;
+    assert!(is_marked(&path));
+    let fh = opened.unwrap().fh;
+    fs.release(REQUEST, inode, fh, 0, 0, false, false)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_file_of_another_node_from_memory_notes_it_for_its_node() {
+    let state = state_of(velo().await, "/nonexistent".into(), 1 << 20);
+    let key = Key {
+        node: NodeId::parse("b").unwrap(),
+        path: RelPath::parse("x.bin").unwrap(),
+    };
+    let stat = Stat {
+        size: 4,
+        mtime: 1.0,
+    };
+    state.index.write().add(&key.node, &key.path, stat);
+    // Read before, and kept.
+    let read = async { Ok(Bytes::from_static(b"1234")) };
+    state.cache.get_or_fetch(&key, || read).await.unwrap();
+    let fs = RviewFs::new(Arc::clone(&state), tokio::runtime::Handle::current(), None);
+    let found = fs.lookup(REQUEST, ROOT, OsStr::new("x.bin")).await.unwrap();
+    assert!(state.used.take().is_empty());
+    let inode = InodeId(found.attr.ino);
+    let opened = fs.open(REQUEST, inode, libc::O_RDONLY as u32).await;
+    let mut buf = [0u8; 4];
+    let fh = opened.unwrap().fh;
+    assert_eq!(fs.read(REQUEST, inode, fh, 0, &mut buf).await.unwrap(), 4);
+    assert_eq!(&buf, b"1234");
+    let noted = state.used.take();
+    assert_eq!(noted.len(), 1);
+    assert!(noted[&key.node].contains(&key.path));
 }

@@ -69,7 +69,7 @@ struct Peer {
 
 /// What a heartbeat tells of its node.
 #[derive(Debug, PartialEq, Eq)]
-enum Heard {
+pub(crate) enum Heard {
     /// It is up as the instance we know.
     Again,
     /// We did not know it: it is new, or back after it went.
@@ -98,7 +98,7 @@ impl Nodes {
     }
 
     /// Note a heartbeat.
-    fn heard(&mut self, node: NodeId, instance: InstanceId) -> Heard {
+    pub(crate) fn heard(&mut self, node: NodeId, instance: InstanceId) -> Heard {
         let seen = Instant::now();
         match self.peers.insert(node, Peer { instance, seen }) {
             None => Heard::New,

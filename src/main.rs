@@ -23,6 +23,7 @@ use rview_fs::index::{Index, NodeId};
 use rview_fs::passthrough::Passthrough;
 use rview_fs::remote::{RemoteFiles, Stalls};
 use rview_fs::state::State;
+use rview_fs::used::{self, Used};
 use rview_fs::{metrics, remote, sync, transfer};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
@@ -278,6 +279,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         nodes: RwLock::default(),
         cache: ContentCache::new((args.cache_gib * f64::from(1u32 << 30)) as u64),
         remote: RemoteFiles::default(),
+        used: Used::default(),
         velo: velo.clone(),
         rdma: pinned,
         stalls,
@@ -310,6 +312,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     )?;
     tasks.spawn(transfer::reap(velo.clone(), stages, held, cancel.clone()));
     tasks.spawn(remote::renew(Arc::clone(&state), cancel.clone()));
+    tasks.spawn(used::tell(Arc::clone(&state), cancel.clone()));
     tasks.spawn(sync::rescan(Arc::clone(&state), cancel.clone()));
     if let Some(addr) = args.metrics {
         let listener = tokio::net::TcpListener::bind(addr)

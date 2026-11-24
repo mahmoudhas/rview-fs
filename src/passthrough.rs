@@ -13,10 +13,12 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
 use crate::health::Degraded;
+use crate::used::MARK_EVERY;
 
 /// struct fuse_backing_map, from linux/fuse.h.
 #[repr(C)]
@@ -59,42 +61,62 @@ fn backing_close(fuse: RawFd, id: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// The backing file of each inode passed through, and how many opens use it.
+/// The backing file of each inode passed through, how many opens use it, and when the
+/// export's file was last marked as used for them (used.rs).
 #[derive(Default)]
 struct Backings {
-    by_inode: HashMap<u64, (i32, usize)>,
+    by_inode: HashMap<u64, Backing>,
+}
+
+struct Backing {
+    id: i32,
+    opens: usize,
+    marked: Instant,
 }
 
 impl Backings {
     /// The backing file of `ino`, for one more open of it.
     fn reuse(&mut self, ino: u64) -> Option<i32> {
-        let (id, opens) = self.by_inode.get_mut(&ino)?;
-        *opens += 1;
-        Some(*id)
+        let backing = self.by_inode.get_mut(&ino)?;
+        backing.opens += 1;
+        Some(backing.id)
     }
 
-    /// Make `id` the backing file of `ino`, for one open of it; unless another open
-    /// registered one meanwhile, which it then uses, and `id` is left over.
-    fn adopt(&mut self, ino: u64, id: i32) -> (i32, Option<i32>) {
+    /// Make `id` the backing file of `ino`, for one open of it, which marked the file at
+    /// `now`; unless another open registered one meanwhile, which it then uses, and `id`
+    /// is left over.
+    fn adopt(&mut self, ino: u64, id: i32, now: Instant) -> (i32, Option<i32>) {
         match self.reuse(ino) {
             Some(theirs) => (theirs, Some(id)),
             None => {
-                self.by_inode.insert(ino, (id, 1));
+                let (opens, marked) = (1, now);
+                self.by_inode.insert(ino, Backing { id, opens, marked });
                 (id, None)
             }
         }
     }
 
+    /// Whether the file of `ino` is to be marked as used at `now`: when its opens share a
+    /// backing file, and none marked it within MARK_EVERY.
+    fn mark_due(&mut self, ino: u64, now: Instant) -> bool {
+        let Some(backing) = self.by_inode.get_mut(&ino) else {
+            return false;
+        };
+        let due = now.saturating_duration_since(backing.marked) >= MARK_EVERY;
+        if due {
+            backing.marked = now;
+        }
+        due
+    }
+
     /// One open of `ino` is done: the backing file to close, when it was the last.
     fn release(&mut self, ino: u64) -> Option<i32> {
-        let (id, opens) = self.by_inode.get_mut(&ino)?;
-        *opens -= 1;
-        if *opens > 0 {
+        let backing = self.by_inode.get_mut(&ino)?;
+        backing.opens -= 1;
+        if backing.opens > 0 {
             return None;
         }
-        let id = *id;
-        self.by_inode.remove(&ino);
-        Some(id)
+        self.by_inode.remove(&ino).map(|backing| backing.id)
     }
 }
 
@@ -156,11 +178,18 @@ impl Passthrough {
         self.backings.lock().reuse(ino)
     }
 
-    /// Pass `file` through as inode `ino`, for one open of it; or None, having said why
-    /// not. Another open that did so meanwhile has its backing file used instead.
+    /// Whether an open of inode `ino` that reuses its backing file is to mark the
+    /// export's file as used: such opens open nothing of the export.
+    pub fn mark_due(&self, ino: u64) -> bool {
+        self.backings.lock().mark_due(ino, Instant::now())
+    }
+
+    /// Pass `file`, just opened and marked as used, through as inode `ino`, for one open
+    /// of it; or None, having said why not. Another open that did so meanwhile has its
+    /// backing file used instead.
     pub fn open(&self, ino: u64, file: &File) -> Option<i32> {
         let id = self.register(file)?;
-        let (id, left_over) = self.backings.lock().adopt(ino, id);
+        let (id, left_over) = self.backings.lock().adopt(ino, id, Instant::now());
         if let Some(left_over) = left_over {
             self.unregister(left_over);
         }

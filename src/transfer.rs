@@ -1,8 +1,9 @@
 //! Moving files between the machines with velo.
 //!
 //! Each node serves its own export to the others: a listing of its files; a file held
-//! open for one of them from its open until its close (held.rs); and such a file's bytes,
-//! staged when it reads them. Staged in RDMA-registered memory (with the `ucx` feature),
+//! open for one of them from its open until its close (held.rs); such a file's bytes,
+//! staged when it reads them; and the marking of its files as used that another node
+//! read from its own memory (used.rs). Staged in RDMA-registered memory (with the `ucx` feature),
 //! the reader's NIC reads them straight into the reader's host memory; otherwise they are
 //! pulled in chunks over TCP. A listing is staged too, in plain memory: a message carries
 //! at most 16 MiB, and the listing of tens of thousands of files deep in folders is more.
@@ -30,12 +31,14 @@ use velo::{
 use crate::content;
 use crate::held::Held;
 use crate::path::{self, RelPath};
+use crate::used;
 
 pub const LIST: &str = "rview_list";
 pub const OPEN: &str = "rview_open";
 pub const FETCH: &str = "rview_fetch";
 pub const CLOSE: &str = "rview_close";
 pub const RENEW: &str = "rview_renew";
+pub const USED: &str = "rview_used";
 /// How long a call waits for its answer: less than held::GRACE.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a file may take to move over RDMA, where one moves in milliseconds: one that
@@ -94,6 +97,11 @@ struct FetchRequest {
 struct RenewRequest {
     client: InstanceId,
     open: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UsedRequest {
+    paths: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -157,8 +165,7 @@ fn scan_dir(fd: &OwnedFd, dir: &str, files: &mut Vec<Listed>) -> io::Result<()> 
 }
 
 /// The file at `path` in the export at `root`, open, and its size; None when it is not
-/// there. Opening it for another node counts as using it: its time is renewed, which a
-/// cleanup that deletes the least recently used files can go by. Blocks.
+/// there. Opening it for another node counts as using it (used.rs). Blocks.
 pub fn open_export_file(root: &Path, path: &RelPath) -> io::Result<Option<(File, u64)>> {
     let file = match path::open_file(root, path) {
         Ok(file) => file,
@@ -169,10 +176,27 @@ pub fn open_export_file(root: &Path, path: &RelPath) -> io::Result<Option<(File,
     if !meta.is_file() {
         return Err(io::Error::other(format!("{path} is not a file")));
     }
-    if let Err(e) = file.set_modified(SystemTime::now()) {
-        tracing::debug!(%path, %e, "could not mark a file another node opened as used");
+    if let Err(e) = used::mark(&file) {
+        used::cannot_mark(&e);
     }
     Ok(Some((file, meta.len())))
+}
+
+/// Mark the files at `paths` in the export at `root` as used: another node read them
+/// from its memory. Those not there anymore, and what is no path in the export, are
+/// passed over. How many it marked. Blocks.
+pub fn mark_export_files(root: &Path, paths: &[String]) -> usize {
+    let mut marked = 0;
+    for path in paths {
+        let Some(path) = RelPath::parse(path) else {
+            continue;
+        };
+        match used::mark_export_file(root, &path) {
+            Ok(there) => marked += usize::from(there),
+            Err(e) => used::cannot_mark(&e),
+        }
+    }
+    marked
 }
 
 /// The bytes of a held file, mapped. Blocks.
@@ -292,7 +316,7 @@ pub fn serve(
         })
         .build(),
     )?;
-    let opened_by = Arc::clone(&held);
+    let (opened_by, used_root) = (Arc::clone(&held), root.clone());
     velo.register_handler(
         Handler::typed_unary_async(OPEN, move |ctx: TypedContext<OpenRequest>| {
             let (root, held) = (root.clone(), Arc::clone(&opened_by));
@@ -311,6 +335,17 @@ pub fn serve(
                         held.count()
                     )),
                 }
+            }
+        })
+        .build(),
+    )?;
+    velo.register_handler(
+        Handler::typed_unary_async(USED, move |ctx: TypedContext<UsedRequest>| {
+            let root = used_root.clone();
+            async move {
+                tokio::task::spawn_blocking(move || mark_export_files(&root, &ctx.input.paths))
+                    .await?;
+                Ok(())
             }
         })
         .build(),
@@ -585,6 +620,18 @@ pub async fn close(velo: &Velo, instance: InstanceId, handle: u64) -> anyhow::Re
         .send()
         .await
         .context("closing a file another node holds")
+}
+
+/// Tell the node that we read the files at `paths` of its export from our memory.
+pub async fn used(velo: &Velo, instance: InstanceId, paths: Vec<String>) -> anyhow::Result<()> {
+    velo.typed_unary::<()>(USED)?
+        .payload(&UsedRequest { paths })?
+        .instance(instance)
+        // A note late by this much is overtaken by the next.
+        .timeout(2 * used::TELL_EVERY)
+        .send()
+        .await
+        .context("telling a node which of its files we read")
 }
 
 /// Tell the node which of the files it holds open for us we still have open: all.

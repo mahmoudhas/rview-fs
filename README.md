@@ -80,6 +80,7 @@ the other had already, not only those announced since.
 | FUSE over io_uring | Linux 6.14 built with `CONFIG_FUSE_IO_URING` | rview-fs does not start: fractal-fuse has no other way. rview-fs turns the kernel's switch on (`/sys/module/fuse/parameters/enable_uring`) when it is off |
 | Passthrough | Linux 6.9 built with `CONFIG_FUSE_PASSTHROUGH`, `CAP_SYS_ADMIN`, and the export on a plain file system: not overlayfs | rview-fs serves the reads of this machine's files itself, several times slower. It serves the files of other machines either way |
 | RDMA | A build with `--features ucx` (the default), rdma-core's libraries, and an RDMA NIC with DC (`dc_mlx5`); on RoCE, the host's network namespace, and with several NICs, UCX on one port: `UCX_NET_DEVICES=mlx5_0:1` | Files move between machines over TCP |
+| Marking the files read | The export mounted read-write, and its files owned by rview-fs's user, or `CAP_FOWNER` | Files read keep their access time (Exports): a cleanup that keeps the files last read deletes files still read |
 
 What is missing is logged as an error, `DEGRADED: ... is not available: <why>`, when
 rview-fs finds it, and again every 10 minutes. So is a transfer over TCP while RDMA is on,
@@ -103,8 +104,21 @@ Whatever writes into an export follows three rules:
 - A machine that holds a file at some path holds the same bytes there as every other
   machine that holds one.
 
-A file another machine opens has its modification time renewed, so a cleanup that deletes
-the least recently used files keeps the ones other machines use.
+A file opened through any machine's mount has its access time renewed in the export that
+holds it, and its modification time left alone. A cleanup of an export that deletes the
+least recently read files then keeps the ones still read anywhere. rview-fs sets the time
+itself, so this holds on a file system mounted `noatime` or `relatime` too:
+
+- A machine's own file is marked when it is opened there; while its opens share one
+  backing file, at most once a second.
+- Another machine's file is marked there when that machine opens it for the reader.
+- Another machine's file read before and kept in memory (`--cache-gib`) opens without
+  asking its machine, which the reader tells within 5 s, and which marks the file then.
+  An rview-fs from before it took such notes cannot be told: the reader says so, every 10
+  minutes.
+
+A cleanup that goes by the modification time alone sees none of this: have it go by the
+later of the two times.
 
 ## NATS
 

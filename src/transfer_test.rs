@@ -1,4 +1,5 @@
 use super::*;
+use crate::used::tests::{age, is_marked};
 
 #[test]
 fn a_scan_lists_only_the_visible_files() {
@@ -49,19 +50,13 @@ fn opening_a_file_for_another_node_marks_it_used() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("x.bin");
     std::fs::write(&path, b"1234").unwrap();
-    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    age(&path);
     let rel = |path: &str| RelPath::parse(path).unwrap();
     let (_, size) = open_export_file(dir.path(), &rel("x.bin"))
         .unwrap()
         .unwrap();
     assert_eq!(size, 4);
-    assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > old);
+    assert!(is_marked(&path));
     assert!(
         open_export_file(dir.path(), &rel("gone.bin"))
             .unwrap()
@@ -69,6 +64,20 @@ fn opening_a_file_for_another_node_marks_it_used() {
     );
     std::fs::create_dir(dir.path().join("sub")).unwrap();
     assert!(open_export_file(dir.path(), &rel("sub")).is_err()); // a folder
+}
+
+#[test]
+fn the_files_another_node_read_from_its_memory_are_marked_used() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["x.bin", "y.bin", "z.bin"] {
+        std::fs::write(dir.path().join(name), b"1234").unwrap();
+        age(&dir.path().join(name));
+    }
+    // One gone since, and what is no path in an export, are passed over.
+    let read = ["x.bin", "gone.bin", "z.bin", "../z.bin", ".hidden.tmp"].map(str::to_owned);
+    assert_eq!(mark_export_files(dir.path(), &read), 2);
+    assert!(is_marked(&dir.path().join("x.bin")) && is_marked(&dir.path().join("z.bin")));
+    assert!(!is_marked(&dir.path().join("y.bin")));
 }
 
 #[test]

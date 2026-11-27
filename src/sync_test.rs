@@ -44,6 +44,34 @@ fn a_heartbeat_tells_whether_its_node_is_new_restarted_or_known() {
     assert_eq!(nodes.heard(b, second), Heard::New); // back after it went
 }
 
+#[test]
+fn a_listing_goes_into_the_index_over_many_short_holds_of_it() {
+    // 20,000 files are more than one hold of LISTING_HOLD takes.
+    let index = parking_lot::RwLock::new(Index::new());
+    let b = NodeId::parse("b").unwrap();
+    let stat = Stat {
+        size: 1,
+        mtime: 1.0,
+    };
+    let files = (0..20_000)
+        .map(|i| {
+            (
+                RelPath::parse(&format!("d{}/f{i}.bin", i % 100)).unwrap(),
+                stat,
+            )
+        })
+        .collect();
+    let mut replacement = Replacement::new(&b, files, 10.0, index.read().mark());
+    let mut holds = 1;
+    while replace_part(index.write(), &mut replacement) {
+        holds += 1;
+        // Between two holds the index is anyone's.
+        assert!(index.try_read().is_some());
+    }
+    assert!(holds > 1, "the whole listing went in at one hold");
+    assert_eq!(index.read().file_count(), 20_000);
+}
+
 /// Serve the export at `root` with `velo`, as another node's rview-fs does.
 fn serve(velo: &Velo, root: &Path) {
     let stages = Arc::new(transfer::Stages::new(1 << 20));

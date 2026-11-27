@@ -195,3 +195,43 @@ fn what_a_node_announces_between_the_parts_of_its_listing_stands() {
     assert_eq!(of("big/f04.bin"), None); // the listing did not have it
     assert_eq!(of("d1/e/g1.bin"), Some(vec![(a, 7, 1.0)]));
 }
+
+#[test]
+fn a_file_the_listing_has_never_leaves_the_index_while_the_listing_goes_in() {
+    // The sweep reads on in the listing as it reads on in the index, so both go by the
+    // index's order: a folder's files before the folders below it, and the folders by
+    // their whole paths ("a", "a-b", "a.b", "a/b"). By path alone "a-b/f" is the first
+    // file and "a/b/c" comes before "a/z": read so, the sweep would take listed files
+    // for gone, and they would be missing until the listing puts them back.
+    let a = node("a");
+    let listed = ["a/z", "a/b/c", "a-b/f", "a.b/g", "a/b-c", "top"];
+    let listing = || {
+        listed
+            .iter()
+            .map(|p| (path(p), stat(1)))
+            .collect::<Vec<_>>()
+    };
+    for most in [1, 2, 1000] {
+        let mut ix = Index::new();
+        for (p, stat) in listing() {
+            ix.add(&a, &p, stat);
+        }
+        for gone in ["a/gone", "a/b/gone", "a.b/gone"] {
+            ix.add(&a, &path(gone), stat(1));
+        }
+        let mut replacement = Replacement::new(&a, listing(), 10.0, ix.mark());
+        loop {
+            let more = ix.replace_part(&mut replacement, most);
+            for p in listed {
+                assert!(ix.lookup(p).is_some(), "{p} is missing, in parts of {most}");
+            }
+            if !more {
+                break;
+            }
+        }
+        let kept: Vec<String> = files(&ix).into_iter().map(|(p, _)| p).collect();
+        let mut all = listed.map(str::to_owned);
+        all.sort();
+        assert_eq!(kept, all, "in parts of {most}");
+    }
+}

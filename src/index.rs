@@ -77,10 +77,12 @@ pub struct Replacement {
     node: NodeId,
     listed_at: f64,
     requested: u64,
-    /// The listing, in path order.
+    /// The listing, in the index's order: by folder, then by name.
     files: Vec<(RelPath, Stat)>,
     /// How many of `files` are in.
     added: usize,
+    /// How many of `files` come before where the sweep stands.
+    passed: usize,
     swept: Swept,
     begun: bool,
 }
@@ -97,42 +99,58 @@ enum Swept {
 
 impl Replacement {
     /// `node`'s files as it listed them at `listed_at`, which we requested at `requested`
-    /// (a `mark`).
+    /// (a `mark`). Sorts them: not with the index held.
     pub fn new(
         node: &NodeId,
         mut files: Vec<(RelPath, Stat)>,
         listed_at: f64,
         requested: u64,
     ) -> Self {
-        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        files.sort_unstable_by(|a, b| a.0.split().cmp(&b.0.split()));
         Self {
             node: node.clone(),
             listed_at,
             requested,
             files,
             added: 0,
+            passed: 0,
             swept: Swept::Nothing,
             begun: false,
         }
     }
 
-    fn lists(&self, dir: &str, name: &str) -> bool {
-        self.files
-            .binary_search_by(|(path, _)| cmp_joined(path.as_str(), dir, name))
-            .is_ok()
+    /// How many files the listing has.
+    pub fn count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether the listing has the file `name` of the folder `dir`. For the sweep, which
+    /// asks in the index's order: it reads on in the listing from where it last stood,
+    /// and never searches it.
+    fn lists(&mut self, dir: &str, name: &str) -> bool {
+        while let Some((path, _)) = self.files.get(self.passed) {
+            match path.split().cmp(&(dir, name)) {
+                Ordering::Less => self.passed += 1,
+                Ordering::Equal => return true,
+                Ordering::Greater => return false,
+            }
+        }
+        false
     }
 }
+
+/// The folders `add_listed` reads on through for the next file's before it searches for
+/// it instead: reading one on costs about a tenth of a search.
+const FOLDERS_READ_ON: usize = 8;
 
 /// What comes after `name`, of names in order.
 fn after(name: &str) -> (Bound<&str>, Bound<&str>) {
     (Bound::Excluded(name), Bound::Unbounded)
 }
 
-/// `path` against the child `name` of `dir`, as `join` spells it, without spelling it.
-fn cmp_joined(path: &str, dir: &str, name: &str) -> Ordering {
-    let slash = (!dir.is_empty()).then_some(b'/');
-    path.bytes()
-        .cmp(dir.bytes().chain(slash).chain(name.bytes()))
+/// `name` and what comes after it, of names in order.
+fn from(name: &str) -> (Bound<&str>, Bound<&str>) {
+    (Bound::Included(name), Bound::Unbounded)
 }
 
 impl Default for Index {
@@ -169,6 +187,10 @@ impl Index {
         if let Some(deleted) = self.deleted.get_mut(node) {
             deleted.remove(path);
         }
+        self.insert(node, path, stat);
+    }
+
+    fn insert(&mut self, node: &NodeId, path: &RelPath, stat: Stat) {
         let (dir, name) = path.split();
         self.ensure_dir(dir);
         self.dir_mut(dir)
@@ -233,90 +255,121 @@ impl Index {
         }
         let mut left = most;
         while left > 0 && self.sweep(r, &mut left) {}
-        while left > 0 && r.added < r.files.len() {
+        self.add_listed(r, &mut left);
+        !(matches!(r.swept, Swept::All) && r.added == r.files.len())
+    }
+
+    /// Remove the files `r`'s node no longer has, from where the sweep stands on, looking
+    /// at no more than `left` files and folders; false once every folder is swept. A file
+    /// written since the listing was taken stays.
+    fn sweep(&mut self, r: &mut Replacement, left: &mut usize) -> bool {
+        let stood = std::mem::replace(&mut r.swept, Swept::All);
+        let from = match &stood {
+            Swept::All => return false,
+            Swept::Nothing => Bound::Unbounded,
+            // A folder gone since is none of the range's, which begins after it.
+            Swept::Part(dir, _) => Bound::Included(dir.as_str()),
+            Swept::Folder(dir) => Bound::Excluded(dir.as_str()),
+        };
+        let mut stale = Vec::new();
+        // The folder reached, and the name in it when it is not done.
+        let mut reached: Option<(&str, Option<&str>)> = None;
+        let mut all = true;
+        for (dir, folder) in self.dirs.range::<str, _>((from, Bound::Unbounded)) {
+            if *left == 0 {
+                all = false;
+                break;
+            }
+            // A folder with no file to look at is looked at all the same.
+            *left -= 1;
+            let names = match &stood {
+                Swept::Part(part, name) if part == dir => folder.files.range::<str, _>(after(name)),
+                _ => folder.files.range::<str, _>(..),
+            };
+            let mut stopped = None;
+            for (name, sources) in names {
+                if sources
+                    .get(&r.node)
+                    .is_some_and(|stat| stat.mtime < r.listed_at)
+                    && !r.lists(dir, name)
+                {
+                    stale.push(join(dir, name));
+                }
+                if *left == 0 {
+                    stopped = Some(name.as_str());
+                    break;
+                }
+                *left -= 1;
+            }
+            reached = Some((dir, stopped));
+            if stopped.is_some() {
+                all = false;
+                break;
+            }
+        }
+        r.swept = match reached {
+            _ if all => Swept::All,
+            Some((dir, Some(name))) => Swept::Part(dir.to_owned(), name.to_owned()),
+            Some((dir, None)) => Swept::Folder(dir.to_owned()),
+            None => stood,
+        };
+        for path in stale.iter().filter_map(|path| RelPath::parse(path)) {
+            self.remove(&r.node, &path);
+        }
+        !all
+    }
+
+    /// Put the next files of `r`'s listing in, no more than `left` of them, once the sweep
+    /// is done: those the index does not have as listed, unless the node announced them
+    /// since. The listing and the folders are both in order, so the folders are read on
+    /// beside the listing, and one is searched for only when it is far on.
+    fn add_listed(&mut self, r: &mut Replacement, left: &mut usize) {
+        if !matches!(r.swept, Swept::All) {
+            return;
+        }
+        let Some((first, _)) = r.files.get(r.added) else {
+            return;
+        };
+        let mut unknown = Vec::new();
+        let mut sought = first.split().0;
+        let mut folders = self.dirs.range::<str, _>(from(sought)).peekable();
+        while *left > 0 && r.added < r.files.len() {
             let (path, stat) = &r.files[r.added];
+            let (dir, name) = path.split();
+            if sought != dir {
+                let mut read = 0;
+                while folders
+                    .next_if(|(folder, _)| folder.as_str() < dir)
+                    .is_some()
+                {
+                    read += 1;
+                    if read == FOLDERS_READ_ON {
+                        folders = self.dirs.range::<str, _>(from(dir)).peekable();
+                    }
+                }
+                sought = dir;
+            }
+            let known = folders
+                .peek()
+                .filter(|(folder, _)| folder.as_str() == dir)
+                .and_then(|(_, folder)| folder.files.get(name))
+                .and_then(|sources| sources.get(&r.node));
+            if !known.is_some_and(|known| known == stat || known.mtime >= r.listed_at) {
+                unknown.push(r.added);
+            }
             r.added += 1;
-            left -= 1;
+            *left -= 1;
+        }
+        for (path, stat) in unknown.into_iter().map(|i| &r.files[i]) {
             let deleted_since = self
                 .deleted
                 .get(&r.node)
                 .and_then(|deleted| deleted.get(path))
                 .is_some_and(|&at| at > r.requested);
             if !deleted_since {
-                self.add_listed(&r.node, path, *stat, r.listed_at);
+                self.insert(&r.node, path, *stat);
             }
         }
-        !(matches!(r.swept, Swept::All) && r.added == r.files.len())
-    }
-
-    /// Remove the files `r`'s node no longer has, of the next folder or of what is left
-    /// of the one begun, looking at no more than `left` files; false once every folder
-    /// is swept. A file written since the listing was taken stays.
-    fn sweep(&mut self, r: &mut Replacement, left: &mut usize) -> bool {
-        let (dir, from) = match &r.swept {
-            Swept::All => return false,
-            Swept::Part(dir, name) if self.dirs.contains_key(dir.as_str()) => {
-                (Some(dir.clone()), Some(name.clone()))
-            }
-            Swept::Part(dir, _) | Swept::Folder(dir) => {
-                let next = self.dirs.range::<str, _>(after(dir)).next();
-                (next.map(|(dir, _)| dir.clone()), None)
-            }
-            Swept::Nothing => (self.dirs.keys().next().cloned(), None),
-        };
-        let Some(dir) = dir else {
-            r.swept = Swept::All;
-            return false;
-        };
-        let files = &self.dirs[dir.as_str()].files;
-        let mut names = match &from {
-            Some(name) => files.range::<str, _>(after(name)),
-            None => files.range::<str, _>(..),
-        };
-        let mut stale = Vec::new();
-        // A folder with no file to look at is looked at all the same.
-        *left -= 1;
-        r.swept = loop {
-            let Some((name, sources)) = names.next() else {
-                break Swept::Folder(dir.clone());
-            };
-            if sources
-                .get(&r.node)
-                .is_some_and(|stat| stat.mtime < r.listed_at)
-                && !r.lists(&dir, name)
-            {
-                stale.push(name.clone());
-            }
-            if *left == 0 {
-                break Swept::Part(dir.clone(), name.clone());
-            }
-            *left -= 1;
-        };
-        for name in stale {
-            if let Some(path) = RelPath::parse(&join(&dir, &name)) {
-                self.remove(&r.node, &path);
-            }
-        }
-        true
-    }
-
-    /// A file of a listing taken at `listed_at`: unless the node announced it since.
-    fn add_listed(&mut self, node: &NodeId, path: &RelPath, stat: Stat, listed_at: f64) {
-        let (dir, name) = path.split();
-        let known = self
-            .dirs
-            .get(dir)
-            .and_then(|d| d.files.get(name))
-            .and_then(|sources| sources.get(node));
-        if known.is_some_and(|known| *known == stat || known.mtime >= listed_at) {
-            return;
-        }
-        self.ensure_dir(dir);
-        self.dir_mut(dir)
-            .files
-            .entry(name.to_owned())
-            .or_default()
-            .insert(node.clone(), stat);
     }
 
     pub fn lookup(&self, path: &str) -> Option<Entry> {

@@ -30,9 +30,14 @@ const NODE_TTL: Duration = Duration::from_secs(30);
 /// and twice as long after each time since, up to LIST_AGAIN_MOST.
 const LIST_AGAIN_AFTER: Duration = Duration::from_secs(1);
 const LIST_AGAIN_MOST: Duration = Duration::from_secs(30);
-/// The files of a listing looked at each time the index is taken to put it in: about a
-/// millisecond's worth.
-const LISTING_PART: usize = 2000;
+/// How long the index is held at a time to put a listing in, and how long it is then left
+/// to the lookups, which all wait while it is held. The files a part takes in that time
+/// go with their paths' length and the index's size: 2000 at a time, a millisecond's worth
+/// with 170,000 files of short paths, were 8 ms with a million files of 1 kB paths.
+const LISTING_HOLD: Duration = Duration::from_micros(250);
+const LISTING_PAUSE: Duration = Duration::from_millis(1);
+/// The files of a listing looked at between two looks at the clock.
+const LISTING_STEP: usize = 64;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Heartbeat {
@@ -278,25 +283,37 @@ pub async fn rescan(
 
 /// Our export as it is on disk.
 pub async fn scan_local(state: &State) -> anyhow::Result<()> {
-    let root = state.export.clone();
+    let (root, me) = (state.export.clone(), state.me.clone());
     let started = Instant::now();
     let requested = state.index.read().mark();
-    let listing = tokio::task::spawn_blocking(move || transfer::scan(&root)).await??;
-    let files = parse_listing(listing.files);
-    let count = files.len();
-    let mut replacement = Replacement::new(&state.me, files, listing.listed_at, requested);
+    let mut replacement = tokio::task::spawn_blocking(move || {
+        transfer::scan(&root).map(|listing| replacement(&me, listing, requested))
+    })
+    .await??;
+    let count = replacement.count();
     while replace_part(state.index.write(), &mut replacement) {
-        tokio::task::yield_now().await;
+        tokio::time::sleep(LISTING_PAUSE).await;
     }
     tracing::info!(count, elapsed = ?started.elapsed(), "scanned the export");
     Ok(())
 }
 
-/// The next part of a listing into the index, which is held for no more than that: every
-/// lookup waits for whoever holds it, and for a node's whole listing (170,000 files) that
-/// was 0.6 s. Whoever waited has it next. False once the listing is in.
+/// `node`'s listing, requested at `requested`, ready to go into the index. Blocks: it
+/// sorts the listing.
+fn replacement(node: &NodeId, listing: transfer::Listing, requested: u64) -> Replacement {
+    let files = parse_listing(listing.files);
+    Replacement::new(node, files, listing.listed_at, requested)
+}
+
+/// The next part of a listing into the index, which is held for LISTING_HOLD and no
+/// longer: every lookup waits for whoever holds it. Whoever waited has it next, and the
+/// caller leaves it alone for LISTING_PAUSE. False once the listing is in.
 fn replace_part(mut index: RwLockWriteGuard<'_, Index>, replacement: &mut Replacement) -> bool {
-    let more = index.replace_part(replacement, LISTING_PART);
+    let held = Instant::now();
+    let mut more = true;
+    while more && held.elapsed() < LISTING_HOLD {
+        more = index.replace_part(replacement, LISTING_STEP);
+    }
     RwLockWriteGuard::unlock_fair(index);
     more
 }
@@ -325,9 +342,10 @@ async fn list_until_listed(state: Arc<State>, node: NodeId, instance: InstanceId
 async fn list_node(state: &State, node: &NodeId, instance: InstanceId) -> anyhow::Result<()> {
     let requested = state.index.read().mark();
     let listing = transfer::list(&state.velo, instance).await?;
-    let files = parse_listing(listing.files);
-    let count = files.len();
-    let mut replacement = Replacement::new(node, files, listing.listed_at, requested);
+    let of = node.clone();
+    let mut replacement =
+        tokio::task::spawn_blocking(move || replacement(&of, listing, requested)).await?;
+    let count = replacement.count();
     loop {
         {
             // Held while a part of the files goes in, so that the node does not expire
@@ -345,7 +363,7 @@ async fn list_node(state: &State, node: &NodeId, instance: InstanceId) -> anyhow
                 break;
             }
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(LISTING_PAUSE).await;
     }
     tracing::info!(node = node.as_str(), count, "listed a node's files");
     Ok(())

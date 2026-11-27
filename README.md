@@ -67,11 +67,14 @@ the other had already, not only those announced since.
   files of a machine gone.
 - A machine that heartbeats an address velo cannot use is left out, and said so at each
   heartbeat, until it heartbeats one velo can.
-- A listing goes into what rview-fs knows a part at a time, 2000 files at once: every
-  lookup waits while that is changed, about a millisecond a part. Put in whole, the
-  listing of a machine with 170,000 files held up every lookup for 0.6 s, at each
-  machine's listing, every ten minutes. What the machine announces between two parts
-  stands.
+- A listing goes into what rview-fs knows a part at a time: every lookup waits while
+  that is changed, so it is changed for a quarter of a millisecond at a time and left to
+  the lookups for a millisecond between. Put in whole, the listing of a machine with
+  170,000 files held up every lookup for 0.6 s. In parts of 2000 files, the listings of
+  three machines with 400,000 files each, of paths of 1 kB, held every lookup up for 7 ms
+  a part, 25 s of the minute in which the machines are listed: programs opened an eighth
+  of the files they opened before and after. What the machine announces between two
+  parts stands.
 
 ## What it needs, and what happens without
 

@@ -466,7 +466,10 @@ pub async fn list(velo: &Velo, instance: InstanceId) -> anyhow::Result<Listing> 
         .with_context(|| format!("no reply in {CALL_TIMEOUT:?} reading a peer's listing"))?
         .context("reading a peer's listing")?;
     velo.release(staged.handle, lease).await?;
-    serde_json::from_slice(&json).context("parsing a peer's listing")
+    // Seconds of work for the listing of a big export: not on a thread of the runtime.
+    tokio::task::spawn_blocking(move || serde_json::from_slice(&json))
+        .await?
+        .context("parsing a peer's listing")
 }
 
 /// Have the node open a file of its export, and hold it open for us until we close it.

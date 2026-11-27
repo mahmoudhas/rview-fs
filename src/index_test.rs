@@ -235,3 +235,17 @@ fn a_file_the_listing_has_never_leaves_the_index_while_the_listing_goes_in() {
         assert_eq!(kept, all, "in parts of {most}");
     }
 }
+
+#[test]
+fn the_deletions_a_listing_has_leave_the_index_with_it_to_be_freed_later() {
+    let (a, mut ix) = (node("a"), Index::new());
+    ix.delete(&a, &path("before.bin"));
+    let requested = ix.mark();
+    ix.delete(&a, &path("since.bin")); // announced while the listing was on its way
+    let listing = vec![(path("since.bin"), stat(1))];
+    let mut replacement = Replacement::new(&a, listing, 10.0, requested);
+    while ix.replace_part(&mut replacement, 1) {}
+    assert_eq!(replacement.forgotten, [(path("before.bin"), 1)]);
+    assert_eq!(ix.deleted[&a].len(), 1);
+    assert_eq!(ix.file_count(), 0);
+}

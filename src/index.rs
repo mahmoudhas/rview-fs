@@ -85,6 +85,9 @@ pub struct Replacement {
     passed: usize,
     swept: Swept,
     begun: bool,
+    /// The deletions the listing has, taken out of the index as it began: freed with the
+    /// replacement, since freeing their paths takes too long to hold the index for.
+    forgotten: Vec<(RelPath, u64)>,
 }
 
 /// How far the sweep for the files a node no longer has is through the index's folders.
@@ -116,6 +119,7 @@ impl Replacement {
             passed: 0,
             swept: Swept::Nothing,
             begun: false,
+            forgotten: Vec::new(),
         }
     }
 
@@ -249,7 +253,9 @@ impl Index {
         if !r.begun {
             // The listing has every deletion announced before it was requested.
             if let Some(deleted) = self.deleted.get_mut(&r.node) {
-                deleted.retain(|_, at| *at > r.requested);
+                r.forgotten.reserve_exact(deleted.len());
+                r.forgotten
+                    .extend(deleted.extract_if(|_, at| *at <= r.requested));
             }
             r.begun = true;
         }

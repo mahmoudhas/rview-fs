@@ -26,7 +26,6 @@ use crate::transfer;
 
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 const NODE_TTL: Duration = Duration::from_secs(30);
-const RESCAN_EVERY: Duration = Duration::from_secs(600);
 /// A node that showed up and did not answer its listing is listed again this much later,
 /// and twice as long after each time since, up to LIST_AGAIN_MOST.
 const LIST_AGAIN_AFTER: Duration = Duration::from_secs(1);
@@ -246,9 +245,13 @@ pub async fn watch_nodes(
     }
 }
 
-/// Our own export and every node's, again every few minutes, until cancelled.
-pub async fn rescan(state: Arc<State>, cancel: CancellationToken) -> anyhow::Result<()> {
-    let mut tick = tokio::time::interval(RESCAN_EVERY);
+/// Our own export and every node's, again every `every`, until cancelled.
+pub async fn rescan(
+    state: Arc<State>,
+    every: Duration,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut tick = tokio::time::interval(every);
     tick.tick().await; // the first tick is now, and startup scanned already
     loop {
         tokio::select! {

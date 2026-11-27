@@ -71,6 +71,10 @@ struct Args {
     /// Where to serve Prometheus metrics, velo's and rview-fs's own (off by default).
     #[arg(long, env = "RVIEW_METRICS")]
     metrics: Option<SocketAddr>,
+    /// Seconds between two listings of this machine's export and of every other machine's,
+    /// which find the files whose announcements were lost.
+    #[arg(long, env = "RVIEW_RESCAN_S", default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+    rescan_s: u64,
     /// Threads that serve FUSE requests.
     #[arg(long, default_value_t = 8)]
     fuse_workers: usize,
@@ -313,7 +317,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     tasks.spawn(transfer::reap(velo.clone(), stages, held, cancel.clone()));
     tasks.spawn(remote::renew(Arc::clone(&state), cancel.clone()));
     tasks.spawn(used::tell(Arc::clone(&state), cancel.clone()));
-    tasks.spawn(sync::rescan(Arc::clone(&state), cancel.clone()));
+    tasks.spawn(sync::rescan(
+        Arc::clone(&state),
+        Duration::from_secs(args.rescan_s),
+        cancel.clone(),
+    ));
     if let Some(addr) = args.metrics {
         let listener = tokio::net::TcpListener::bind(addr)
             .await

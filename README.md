@@ -20,7 +20,7 @@ their files on [NATS](https://nats.io).
 - Whatever writes into an export announces each file it adds or deletes on NATS. Each
   rview-fs keeps an index of every machine's files from those announcements, and lists a
   machine's export when the machine shows up, again until it answers, and every 10
-  minutes.
+  minutes (`--rescan-s`).
 - Opening a file of this machine hands the export's file to the kernel, which reads and
   maps it with no request to rview-fs. All the opens of a file share one backing file,
   the one the kernel allows a file at a time.
@@ -99,8 +99,8 @@ Whatever writes into an export follows three rules:
   or serves it. Write a file under a temporary name (`.data.bin.k3j.tmp`), then link or
   rename it to its shared name once it is complete; it never changes after that.
 - Announce every file that becomes visible or goes away, on NATS (below). rview-fs also
-  lists every machine when it shows up and every 10 minutes, so an announcement lost on
-  the way only makes a file late.
+  lists every machine when it shows up and every 10 minutes (`--rescan-s`), so an
+  announcement lost on the way only makes a file late.
 - A machine that holds a file at some path holds the same bytes there as every other
   machine that holds one.
 
@@ -151,6 +151,7 @@ UCX_NET_DEVICES=mlx5_0:1 \
 | `--cache-gib` | Host memory for the files of other machines read before (16) |
 | `--stage-gib` | Host memory this machine stages its files in while the others read them (16); past it, they cannot read its files until stages are taken |
 | `--bind` | Where velo listens for the other machines (`0.0.0.0:0`) |
+| `--rescan-s` (`RVIEW_RESCAN_S`) | Seconds between two listings of every machine's export, this one's own too (600): the most a file whose announcement was lost is late by |
 | `--metrics` (`RVIEW_METRICS`) | Where to serve Prometheus metrics, such as `127.0.0.1:9300` (off) |
 | `--fuse-workers`, `--fuse-queue-depth` | Threads serving FUSE requests (8), and requests in flight per kernel queue (8) |
 | `--no-passthrough` | Serve the reads of this machine's files too |

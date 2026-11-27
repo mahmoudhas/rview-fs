@@ -1,5 +1,6 @@
 //! Paths inside an exported directory, and opening them.
 
+use std::borrow::Borrow;
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -18,10 +19,15 @@ pub const FOLDER: OFlags = OFlags::RDONLY
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelPath(String);
 
+/// Whether `path` is one inside an export, as `RelPath` has them.
+pub fn is_valid(path: &str) -> bool {
+    let valid = |c: &str| !c.is_empty() && !c.starts_with('.') && !c.contains('\0');
+    path.split('/').all(valid)
+}
+
 impl RelPath {
     pub fn parse(path: &str) -> Option<Self> {
-        let valid = |c: &str| !c.is_empty() && !c.starts_with('.') && !c.contains('\0');
-        path.split('/').all(valid).then(|| Self(path.to_owned()))
+        is_valid(path).then(|| Self(path.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -31,6 +37,12 @@ impl RelPath {
     /// The folder (empty at the root) and the name.
     pub fn split(&self) -> (&str, &str) {
         self.0.rsplit_once('/').unwrap_or(("", &self.0))
+    }
+}
+
+impl Borrow<str> for RelPath {
+    fn borrow(&self) -> &str {
+        &self.0
     }
 }
 

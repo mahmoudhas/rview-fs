@@ -75,6 +75,10 @@ the other had already, not only those announced since.
   a part, 25 s of the minute in which the machines are listed: programs opened an eighth
   of the files they opened before and after. What the machine announces between two
   parts stands.
+- A listing is held in two pieces of memory whatever its size, its paths in one, and both
+  go back to the kernel once it is in. Held as a string a path, the memory of 400,000
+  paths of 1 kB stayed with the allocator after every listing: in a group of three
+  machines listed every ten minutes, each rview-fs grew by 4 to 5 GiB an hour.
 
 ## What it needs, and what happens without
 

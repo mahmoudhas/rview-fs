@@ -326,8 +326,7 @@ pub async fn scan_local(state: &State) -> anyhow::Result<()> {
 /// `node`'s listing, requested at `requested`, ready to go into the index. Blocks: it
 /// sorts the listing.
 fn replacement(node: &NodeId, listing: transfer::Listing, requested: u64) -> Replacement {
-    let files = parse_listing(listing.files);
-    Replacement::new(node, files, listing.listed_at, requested)
+    Replacement::new(node, listing.files, listing.listed_at, requested)
 }
 
 /// The next part of a listing into the index, which is held for LISTING_HOLD and no
@@ -392,21 +391,6 @@ async fn list_node(state: &State, node: &NodeId, instance: InstanceId) -> anyhow
     }
     tracing::info!(node = node.as_str(), count, "listed a node's files");
     Ok(())
-}
-
-fn parse_listing(files: Vec<transfer::Listed>) -> Vec<(RelPath, Stat)> {
-    files
-        .into_iter()
-        .filter_map(|f| {
-            Some((
-                RelPath::parse(&f.path)?,
-                Stat {
-                    size: f.size,
-                    mtime: f.mtime,
-                },
-            ))
-        })
-        .collect()
 }
 
 #[cfg(test)]

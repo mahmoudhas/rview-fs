@@ -10,7 +10,9 @@
 //! The bytes staged at once are bounded; a stage is gone once its reader took it, and
 //! dropped after a while if it never does.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -22,7 +24,8 @@ use anyhow::{Context as _, anyhow};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prometheus::{HistogramOpts, HistogramTimer, HistogramVec, IntCounterVec, Opts, Registry};
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio_util::sync::CancellationToken;
 use velo::{
     DataHandle, Handler, InstanceId, RdmaDestination, RendezvousWrite, TypedContext, Velo, WeakVelo,
@@ -30,6 +33,7 @@ use velo::{
 
 use crate::content;
 use crate::held::Held;
+use crate::index::{self, Files, Stat};
 use crate::path::{self, RelPath};
 use crate::used;
 
@@ -50,16 +54,52 @@ const REAP_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Listing {
-    pub files: Vec<Listed>,
+    pub files: Files,
     /// When the walk started, in seconds since the epoch.
     pub listed_at: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Listed {
-    pub path: String,
-    pub size: u64,
-    pub mtime: f64,
+/// A file of a listing, as it is sent.
+#[derive(Serialize, Deserialize)]
+struct Sent<'a> {
+    #[serde(borrow)]
+    path: Cow<'a, str>,
+    size: u64,
+    mtime: f64,
+}
+
+impl Serialize for Files {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter().map(|(path, stat)| Sent {
+            path: Cow::Borrowed(path),
+            size: stat.size,
+            mtime: stat.mtime,
+        }))
+    }
+}
+
+impl<'de> Deserialize<'de> for Files {
+    /// Each path goes from the text into the files' one piece of memory. One that is no
+    /// path of an export is left out.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AllSent;
+        impl<'de> Visitor<'de> for AllSent {
+            type Value = Files;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("the files of a listing")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut sent: A) -> Result<Files, A::Error> {
+                let mut files = Files::default();
+                while let Some(Sent { path, size, mtime }) = sent.next_element()? {
+                    files.push_path(&path, Stat { size, mtime });
+                }
+                Ok(files)
+            }
+        }
+        deserializer.deserialize_seq(AllSent)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,7 +159,7 @@ pub fn now() -> f64 {
 /// Every visible file below `root`. Blocks.
 pub fn scan(root: &Path) -> io::Result<Listing> {
     let listed_at = now();
-    let mut files = Vec::new();
+    let mut files = Files::default();
     match path::open_dir(root, "") {
         Ok(top) => scan_dir(&top, "", &mut files)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {} // nothing exported yet
@@ -130,7 +170,7 @@ pub fn scan(root: &Path) -> io::Result<Listing> {
 
 /// Every visible file in the folder `dir`, open as `fd`, and in the folders below it,
 /// each opened in the one above (`path::open_dir` says why). Blocks.
-fn scan_dir(fd: &OwnedFd, dir: &str, files: &mut Vec<Listed>) -> io::Result<()> {
+fn scan_dir(fd: &OwnedFd, dir: &str, files: &mut Files) -> io::Result<()> {
     for entry in rustix::fs::Dir::read_from(fd)? {
         let entry = entry?;
         let Ok(name) = entry.file_name().to_str() else {
@@ -143,21 +183,22 @@ fn scan_dir(fd: &OwnedFd, dir: &str, files: &mut Vec<Listed>) -> io::Result<()> 
         let Ok(stat) = rustix::fs::statat(fd, name, flags) else {
             continue; // removed meanwhile
         };
-        let rel = path::join(dir, name);
         match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
             rustix::fs::FileType::Directory => {
                 match rustix::fs::openat(fd, name, path::FOLDER, rustix::fs::Mode::empty()) {
-                    Ok(sub) => scan_dir(&sub, &rel, files)?,
+                    Ok(sub) => scan_dir(&sub, &path::join(dir, name), files)?,
                     Err(rustix::io::Errno::NOENT) => {} // removed meanwhile
                     Err(e) => return Err(e.into()),
                 }
             }
-            rustix::fs::FileType::RegularFile => files.push(Listed {
-                path: rel,
-                size: u64::try_from(stat.st_size).unwrap_or(0),
-                #[allow(clippy::cast_precision_loss)]
-                mtime: stat.st_mtime as f64 + stat.st_mtime_nsec as f64 / 1e9,
-            }),
+            rustix::fs::FileType::RegularFile => {
+                let stat = Stat {
+                    size: u64::try_from(stat.st_size).unwrap_or(0),
+                    #[allow(clippy::cast_precision_loss)]
+                    mtime: stat.st_mtime as f64 + stat.st_mtime_nsec as f64 / 1e9,
+                };
+                files.push(dir, name, stat);
+            }
             _ => {}
         }
     }
@@ -306,8 +347,11 @@ pub fn serve(
             );
             async move {
                 let json = tokio::task::spawn_blocking(move || {
-                    scan(&root)
-                        .and_then(|listing| serde_json::to_vec(&listing).map_err(io::Error::other))
+                    let listing = scan(&root)?;
+                    // In memory of its own from the start, as the listing is.
+                    let mut json = Vec::with_capacity(index::PIECE);
+                    serde_json::to_writer(&mut json, &listing).map_err(io::Error::other)?;
+                    Ok::<_, io::Error>(json)
                 })
                 .await??;
                 let velo = weak.upgrade().ok_or_else(|| anyhow!("shutting down"))?;

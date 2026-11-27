@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
-use crate::path::{RelPath, join};
+use crate::path::{self, RelPath, join};
 
 /// The machine an export is on, which its files are announced under and which its
 /// rview-fs heartbeats with.
@@ -70,6 +70,132 @@ pub struct Index {
     deleted: HashMap<NodeId, HashMap<RelPath, u64>>,
 }
 
+/// The files of a listing, their paths in one piece of memory. A path allocated for each
+/// file, 400,000 of 1 kB, is freed with the listing into the allocator's heaps, which
+/// keep it: a process grew by 1.5 GiB at every listing of three such machines.
+#[derive(Debug, Default)]
+pub struct Files {
+    /// Every path, one after the other.
+    paths: String,
+    files: Vec<Place>,
+}
+
+/// The least a listing asks the allocator for at a time, for its paths, for its files and
+/// for its text on the way to another machine: more than the allocator ever gives from
+/// the heaps it keeps (32 MiB), so that each is memory of its own, which goes back to the
+/// kernel when it is freed. Until it is written to it takes no memory.
+pub const PIECE: usize = 64 << 20;
+
+/// Where a file's path begins in `Files::paths`, and how long its folder (nothing at the
+/// root) and its name are.
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    at: usize,
+    dir: u32,
+    name: u32,
+    stat: Stat,
+}
+
+/// A file of `Files`: its path, which is its folder (empty at the root) and its name.
+#[derive(Clone, Copy)]
+struct Listed<'a> {
+    path: &'a str,
+    dir: &'a str,
+    name: &'a str,
+    stat: Stat,
+}
+
+impl Files {
+    /// Add the file `name` of the folder `dir`, which is empty at the root.
+    pub fn push(&mut self, dir: &str, name: &str, stat: Stat) {
+        let at = self.paths.len();
+        if self.paths.capacity() - at < dir.len() + 1 + name.len() {
+            self.paths.reserve(PIECE);
+        }
+        if self.files.capacity() == self.files.len() {
+            self.files.reserve(PIECE / size_of::<Place>());
+        }
+        if !dir.is_empty() {
+            self.paths.push_str(dir);
+            self.paths.push('/');
+        }
+        self.paths.push_str(name);
+        self.files.push(Place {
+            at,
+            dir: u32::try_from(dir.len()).expect("a path is shorter than 4 GiB"),
+            name: u32::try_from(name.len()).expect("a path is shorter than 4 GiB"),
+            stat,
+        });
+    }
+
+    /// Add the file at `path`, unless that is no path of an export (`RelPath` says).
+    pub fn push_path(&mut self, path: &str, stat: Stat) -> bool {
+        let valid = path::is_valid(path);
+        if valid {
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+            self.push(dir, name, stat);
+        }
+        valid
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Each file's path and stat, in the order they are in.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, Stat)> {
+        let listed = self.files.iter().map(|place| place.listed(&self.paths));
+        listed.map(|file| (file.path, file.stat))
+    }
+
+    fn get(&self, i: usize) -> Option<Listed<'_>> {
+        Some(self.files.get(i)?.listed(&self.paths))
+    }
+
+    /// Into the index's order: by folder, then by name.
+    fn sort(&mut self) {
+        let key = |place: &Place| {
+            let file = place.listed(&self.paths);
+            (file.dir, file.name)
+        };
+        self.files.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+    }
+}
+
+impl Place {
+    fn listed<'a>(&self, paths: &'a str) -> Listed<'a> {
+        let (dir, name) = (self.dir as usize, self.name as usize);
+        let named = self.at + dir + usize::from(dir > 0);
+        Listed {
+            path: &paths[self.at..named + name],
+            dir: &paths[self.at..self.at + dir],
+            name: &paths[named..named + name],
+            stat: self.stat,
+        }
+    }
+}
+
+impl FromIterator<(RelPath, Stat)> for Files {
+    fn from_iter<I: IntoIterator<Item = (RelPath, Stat)>>(files: I) -> Self {
+        let mut all = Self::default();
+        for (path, stat) in files {
+            let (dir, name) = path.split();
+            all.push(dir, name, stat);
+        }
+        all
+    }
+}
+
+impl From<Vec<(RelPath, Stat)>> for Files {
+    fn from(files: Vec<(RelPath, Stat)>) -> Self {
+        files.into_iter().collect()
+    }
+}
+
 /// A listing of a node's files on its way into the index, a part at a time
 /// (`Index::replace_part`): whole, the index is held for all of it, which every lookup
 /// then waits for (0.6 s for a node of 170,000 files).
@@ -78,7 +204,7 @@ pub struct Replacement {
     listed_at: f64,
     requested: u64,
     /// The listing, in the index's order: by folder, then by name.
-    files: Vec<(RelPath, Stat)>,
+    files: Files,
     /// How many of `files` are in.
     added: usize,
     /// How many of `files` come before where the sweep stands.
@@ -103,13 +229,8 @@ enum Swept {
 impl Replacement {
     /// `node`'s files as it listed them at `listed_at`, which we requested at `requested`
     /// (a `mark`). Sorts them: not with the index held.
-    pub fn new(
-        node: &NodeId,
-        mut files: Vec<(RelPath, Stat)>,
-        listed_at: f64,
-        requested: u64,
-    ) -> Self {
-        files.sort_unstable_by(|a, b| a.0.split().cmp(&b.0.split()));
+    pub fn new(node: &NodeId, mut files: Files, listed_at: f64, requested: u64) -> Self {
+        files.sort();
         Self {
             node: node.clone(),
             listed_at,
@@ -132,8 +253,8 @@ impl Replacement {
     /// asks in the index's order: it reads on in the listing from where it last stood,
     /// and never searches it.
     fn lists(&mut self, dir: &str, name: &str) -> bool {
-        while let Some((path, _)) = self.files.get(self.passed) {
-            match path.split().cmp(&(dir, name)) {
+        while let Some(listed) = self.files.get(self.passed) {
+            match (listed.dir, listed.name).cmp(&(dir, name)) {
                 Ordering::Less => self.passed += 1,
                 Ordering::Equal => return true,
                 Ordering::Greater => return false,
@@ -191,11 +312,11 @@ impl Index {
         if let Some(deleted) = self.deleted.get_mut(node) {
             deleted.remove(path);
         }
-        self.insert(node, path, stat);
+        let (dir, name) = path.split();
+        self.insert(node, dir, name, stat);
     }
 
-    fn insert(&mut self, node: &NodeId, path: &RelPath, stat: Stat) {
-        let (dir, name) = path.split();
+    fn insert(&mut self, node: &NodeId, dir: &str, name: &str, stat: Stat) {
         self.ensure_dir(dir);
         self.dir_mut(dir)
             .files
@@ -233,13 +354,7 @@ impl Index {
     /// at `requested` (a `mark`), keeping the files written since, which it announced
     /// after the listing was taken, and not taking back the ones it announced deleted
     /// since we requested it.
-    pub fn replace_node(
-        &mut self,
-        node: &NodeId,
-        files: Vec<(RelPath, Stat)>,
-        listed_at: f64,
-        requested: u64,
-    ) {
+    pub fn replace_node(&mut self, node: &NodeId, files: Files, listed_at: f64, requested: u64) {
         let mut replacement = Replacement::new(node, files, listed_at, requested);
         while self.replace_part(&mut replacement, usize::MAX) {}
     }
@@ -333,15 +448,17 @@ impl Index {
         if !matches!(r.swept, Swept::All) {
             return;
         }
-        let Some((first, _)) = r.files.get(r.added) else {
+        let Some(first) = r.files.get(r.added) else {
             return;
         };
         let mut unknown = Vec::new();
-        let mut sought = first.split().0;
+        let mut sought = first.dir;
         let mut folders = self.dirs.range::<str, _>(from(sought)).peekable();
-        while *left > 0 && r.added < r.files.len() {
-            let (path, stat) = &r.files[r.added];
-            let (dir, name) = path.split();
+        while *left > 0 {
+            let Some(listed) = r.files.get(r.added) else {
+                break;
+            };
+            let (dir, name) = (listed.dir, listed.name);
             if sought != dir {
                 let mut read = 0;
                 while folders
@@ -360,20 +477,20 @@ impl Index {
                 .filter(|(folder, _)| folder.as_str() == dir)
                 .and_then(|(_, folder)| folder.files.get(name))
                 .and_then(|sources| sources.get(&r.node));
-            if !known.is_some_and(|known| known == stat || known.mtime >= r.listed_at) {
-                unknown.push(r.added);
+            if !known.is_some_and(|known| *known == listed.stat || known.mtime >= r.listed_at) {
+                unknown.push(listed);
             }
             r.added += 1;
             *left -= 1;
         }
-        for (path, stat) in unknown.into_iter().map(|i| &r.files[i]) {
+        for listed in unknown {
             let deleted_since = self
                 .deleted
                 .get(&r.node)
-                .and_then(|deleted| deleted.get(path))
+                .and_then(|deleted| deleted.get(listed.path))
                 .is_some_and(|&at| at > r.requested);
             if !deleted_since {
-                self.insert(&r.node, path, *stat);
+                self.insert(&r.node, listed.dir, listed.name, listed.stat);
             }
         }
     }

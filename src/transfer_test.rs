@@ -14,8 +14,8 @@ fn a_scan_lists_only_the_visible_files() {
     let mut listed: Vec<(String, u64)> = scan(root)
         .unwrap()
         .files
-        .into_iter()
-        .map(|f| (f.path, f.size))
+        .iter()
+        .map(|(path, stat)| (path.to_owned(), stat.size))
         .collect();
     listed.sort();
     assert_eq!(
@@ -87,10 +87,36 @@ fn files_deeper_than_a_path_takes_are_listed_and_opened() {
     let listed: Vec<(String, u64)> = scan(dir.path())
         .unwrap()
         .files
-        .into_iter()
-        .map(|f| (f.path, f.size))
+        .iter()
+        .map(|(path, stat)| (path.to_owned(), stat.size))
         .collect();
     assert_eq!(listed, vec![(path.as_str().to_owned(), 4)]);
     let (_, size) = open_export_file(dir.path(), &path).unwrap().unwrap();
     assert_eq!(size, 4);
+}
+
+#[test]
+fn a_listing_is_sent_and_read_as_one_with_a_path_allocated_for_each_file_was() {
+    let mut files = Files::default();
+    let stat = |size, mtime| Stat { size, mtime };
+    files.push("a/b", "t.bin", stat(2, 1.5));
+    files.push("", "top.bin", stat(4, 2.0));
+    let listing = Listing {
+        files,
+        listed_at: 10.0,
+    };
+    assert_eq!(
+        serde_json::to_string(&listing).unwrap(),
+        r#"{"files":[{"path":"a/b/t.bin","size":2,"mtime":1.5},{"path":"top.bin","size":4,"mtime":2.0}],"listed_at":10.0}"#
+    );
+    // A name that is escaped on the way, two paths that are none of an export, and a
+    // field a later version might add.
+    let sent = r#"{"files":[{"path":"a/q\"x.bin","size":1,"mtime":1.0},{"path":".tmp/x","size":1,"mtime":1.0},{"path":"a//b","size":1,"mtime":1.0},{"path":"d/e.bin","size":3,"mtime":2.5,"more":true}],"listed_at":7.0}"#;
+    let got: Listing = serde_json::from_slice(sent.as_bytes()).unwrap();
+    let files: Vec<(&str, Stat)> = got.files.iter().collect();
+    assert_eq!(
+        files,
+        [("a/q\"x.bin", stat(1, 1.0)), ("d/e.bin", stat(3, 2.5))]
+    );
+    assert_eq!(got.listed_at, 7.0);
 }

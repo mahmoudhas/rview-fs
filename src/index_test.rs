@@ -55,7 +55,7 @@ fn a_listing_replaces_what_a_node_had_but_not_what_it_announced_since() {
     ix.add(&node("a"), &path("new.bin"), new);
     ix.replace_node(
         &node("a"),
-        vec![(path("kept.bin"), stat(1))],
+        vec![(path("kept.bin"), stat(1))].into(),
         10.0,
         ix.mark(),
     );
@@ -69,10 +69,10 @@ fn a_listing_does_not_bring_back_a_file_deleted_since_it_was_requested() {
     let requested = ix.mark();
     ix.delete(&node("a"), &path("x.bin")); // announced while the listing was on its way
     let listing = vec![(path("x.bin"), stat(1)), (path("y.bin"), stat(1))];
-    ix.replace_node(&node("a"), listing.clone(), 10.0, requested);
+    ix.replace_node(&node("a"), listing.clone().into(), 10.0, requested);
     assert_eq!(names(&ix, ""), vec!["y.bin".to_owned()]);
     // A listing requested after the deletion has it, if the file is back.
-    ix.replace_node(&node("a"), listing, 10.0, ix.mark());
+    ix.replace_node(&node("a"), listing.into(), 10.0, ix.mark());
     assert_eq!(names(&ix, ""), ["x.bin", "y.bin"].map(str::to_owned));
 }
 
@@ -138,14 +138,14 @@ fn index_and_listing() -> (Index, Vec<(RelPath, Stat)>) {
 #[test]
 fn a_listing_put_in_a_part_at_a_time_ends_as_one_put_in_whole() {
     let (mut whole, listing) = index_and_listing();
-    whole.replace_node(&node("a"), listing.clone(), 10.0, whole.mark());
+    whole.replace_node(&node("a"), listing.clone().into(), 10.0, whole.mark());
     let kept = files(&whole);
     assert!(kept.iter().any(|(p, _)| p == "d2/since.bin"));
     assert!(kept.iter().any(|(p, _)| p == "only-b/g0.bin"));
     assert!(!kept.iter().any(|(p, _)| p == "d2/g0.bin")); // unlisted, and older
     for most in [1, 2, 7, 1000] {
         let (mut ix, listing) = index_and_listing();
-        let mut replacement = Replacement::new(&node("a"), listing, 10.0, ix.mark());
+        let mut replacement = Replacement::new(&node("a"), listing.into(), 10.0, ix.mark());
         let mut parts = 0;
         while ix.replace_part(&mut replacement, most) {
             parts += 1;
@@ -161,7 +161,7 @@ fn a_listing_put_in_a_part_at_a_time_ends_as_one_put_in_whole() {
 fn what_a_node_announces_between_the_parts_of_its_listing_stands() {
     let (mut ix, listing) = index_and_listing();
     let a = node("a");
-    let mut replacement = Replacement::new(&a, listing, 10.0, ix.mark());
+    let mut replacement = Replacement::new(&a, listing.into(), 10.0, ix.mark());
     // After every part: the node deletes a listed file not in yet, one in already and an
     // unlisted one, writes a new file, and writes one of the listing's again.
     let newer = Stat {
@@ -219,7 +219,7 @@ fn a_file_the_listing_has_never_leaves_the_index_while_the_listing_goes_in() {
         for gone in ["a/gone", "a/b/gone", "a.b/gone"] {
             ix.add(&a, &path(gone), stat(1));
         }
-        let mut replacement = Replacement::new(&a, listing(), 10.0, ix.mark());
+        let mut replacement = Replacement::new(&a, listing().into(), 10.0, ix.mark());
         loop {
             let more = ix.replace_part(&mut replacement, most);
             for p in listed {
@@ -243,7 +243,7 @@ fn the_deletions_a_listing_has_leave_the_index_with_it_to_be_freed_later() {
     let requested = ix.mark();
     ix.delete(&a, &path("since.bin")); // announced while the listing was on its way
     let listing = vec![(path("since.bin"), stat(1))];
-    let mut replacement = Replacement::new(&a, listing, 10.0, requested);
+    let mut replacement = Replacement::new(&a, listing.into(), 10.0, requested);
     while ix.replace_part(&mut replacement, 1) {}
     assert_eq!(replacement.forgotten, [(path("before.bin"), 1)]);
     assert_eq!(ix.deleted[&a].len(), 1);

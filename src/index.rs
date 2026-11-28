@@ -68,6 +68,9 @@ pub struct Index {
     /// The files whose deletion was announced, by node, and when on `clock`: a listing
     /// requested before then may still have them.
     deleted: HashMap<NodeId, HashMap<RelPath, u64>>,
+    /// The files no node holds anymore and the folders left empty, since `take_gone`,
+    /// once `note_gone` asked for them.
+    gone: Option<Vec<String>>,
 }
 
 /// The files of a listing, their paths in one piece of memory. A path allocated for each
@@ -264,6 +267,10 @@ impl Replacement {
     }
 }
 
+/// The most paths gone that are kept for `take_gone`: a node that goes takes every file
+/// of its own with it at once, and the rest of those are not noted.
+const GONE_MOST: usize = 1 << 16;
+
 /// The folders `add_listed` reads on through for the next file's before it searches for
 /// it instead: reading one on costs about a tenth of a search.
 const FOLDERS_READ_ON: usize = 8;
@@ -290,7 +297,18 @@ impl Index {
             dirs: BTreeMap::from([(String::new(), Dir::default())]),
             clock: 0,
             deleted: HashMap::new(),
+            gone: None,
         }
+    }
+
+    /// From now on, note every path that goes, for `take_gone`.
+    pub fn note_gone(&mut self) {
+        self.gone.get_or_insert_default();
+    }
+
+    /// The paths of the files and folders gone since this was last called.
+    pub fn take_gone(&mut self) -> Vec<String> {
+        self.gone.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Where we are, to request a listing at: see `replace_node`.
@@ -338,6 +356,9 @@ impl Index {
         }
         if sources.is_empty() {
             d.files.remove(name);
+            if let Some(gone) = self.gone.as_mut().filter(|gone| gone.len() < GONE_MOST) {
+                gone.push(join(dir, name));
+            }
         }
         self.prune(dir);
     }
@@ -554,6 +575,9 @@ impl Index {
         let mut dir = dir.to_owned();
         while !dir.is_empty() && self.dirs.get(&dir).is_some_and(Dir::is_empty) {
             self.dirs.remove(&dir);
+            if let Some(gone) = self.gone.as_mut().filter(|gone| gone.len() < GONE_MOST) {
+                gone.push(dir.clone());
+            }
             let (parent, name) = dir.rsplit_once('/').unwrap_or(("", &dir));
             let parent = parent.to_owned();
             self.dir_mut(&parent).dirs.remove(name);

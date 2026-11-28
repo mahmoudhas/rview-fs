@@ -45,11 +45,12 @@ use fractal_fuse::abi::{
 };
 use fractal_fuse::{
     DirectoryEntry, DirectoryEntryPlus, EIO, EISDIR, ENOENT, Errno, FileAttr, FileHandleId,
-    FileType, Filesystem, FsResult, InodeId, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs,
-    Request, Timestamp,
+    FileType, Filesystem, FsResult, FuseNotifier, InodeId, ReplyAttr, ReplyEntry, ReplyOpen,
+    ReplyStatfs, Request, Timestamp,
 };
 use parking_lot::Mutex;
 use prometheus::{IntGauge, Registry};
+use tokio_util::sync::CancellationToken;
 
 use bytes::Bytes;
 
@@ -67,6 +68,11 @@ const TTL: Duration = Duration::from_secs(1);
 /// less room than its largest write to the file system takes, 1 MiB and its headers as
 /// fractal-fuse sets that, though a forget takes a page at the most.
 const DEV_REQUEST_ROOM: usize = (1 << 20) + (1 << 16);
+/// How often the kernel is told of the files and folders gone since.
+const GONE_EVERY: Duration = Duration::from_millis(200);
+/// The paths looked up in `Inodes` at a time, which every request takes for a moment.
+const GONE_AT_A_TIME: usize = 64;
+
 pub struct RviewFs {
     state: Arc<State>,
     runtime: tokio::runtime::Handle,
@@ -119,6 +125,14 @@ impl Inodes {
         self.by_path.insert(path.to_owned(), ino);
         self.held.inc();
         ino
+    }
+
+    /// The inode of `path`'s folder and `path`'s name in it, when the kernel holds an inode
+    /// of `path`.
+    fn entry_of(&self, path: &str) -> Option<(u64, String)> {
+        self.by_path.get(path)?;
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        Some((*self.by_path.get(dir)?, name.to_owned()))
     }
 
     fn forget(&mut self, ino: u64, n: u64) {
@@ -400,6 +414,55 @@ impl RviewFs {
     /// The count of the inodes the kernel holds, as a metric of `registry`.
     pub fn register(&self, registry: &Registry) -> prometheus::Result<()> {
         registry.register(Box::new(self.inodes.lock().held.clone()))
+    }
+
+    /// Tell the kernel, through `notifier`, of every file and folder gone from the index,
+    /// until cancelled. The kernel keeps an inode for every name it remembers, and rview-fs
+    /// that inode's path; a name nobody asks for again it remembers until it is short of
+    /// memory, so both grew with every file ever opened. Told, it drops the name and what
+    /// is below it, and forgets their inodes.
+    pub fn forget_gone(
+        &self,
+        notifier: FuseNotifier,
+        cancel: CancellationToken,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+        let (state, inodes) = (Arc::clone(&self.state), Arc::clone(&self.inodes));
+        async move {
+            state.index.write().note_gone();
+            let mut tick = tokio::time::interval(GONE_EVERY);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => return Ok(()),
+                    _ = tick.tick() => {}
+                }
+                let gone = state.index.write().take_gone();
+                if gone.is_empty() {
+                    continue;
+                }
+                let (inodes, notifier) = (Arc::clone(&inodes), notifier.clone());
+                // The kernel takes the folder's lock for each: not on a thread of the runtime.
+                tokio::task::spawn_blocking(move || {
+                    for paths in gone.chunks(GONE_AT_A_TIME) {
+                        let held: Vec<(u64, String)> = {
+                            let inodes = inodes.lock();
+                            paths.iter().filter_map(|p| inodes.entry_of(p)).collect()
+                        };
+                        for (folder, name) in held {
+                            match notifier.inval_entry(folder, name.as_bytes()) {
+                                Ok(()) => {}
+                                // It dropped the name by itself since.
+                                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+                                Err(e) => tracing::warn!(
+                                    name,
+                                    "telling the kernel of a file gone failed: {e}"
+                                ),
+                            }
+                        }
+                    }
+                })
+                .await?;
+            }
+        }
     }
 
     fn path(&self, ino: InodeId) -> FsResult<String> {

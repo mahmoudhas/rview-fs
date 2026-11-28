@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use fractal_fuse::{MountOptions, Session};
+use fractal_fuse::{FuseNotifier, MountOptions, Session};
 use parking_lot::RwLock;
 use prometheus::Registry;
 use rview_fs::cache::ContentCache;
@@ -378,6 +378,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     fs.register(&registry)?;
     fs.read_forgets(session.fuse_fd(), args.mount.clone())?;
+    tasks.spawn(fs.forget_gone(FuseNotifier::from(session.fuse_fd()), cancel.clone()));
     let (ended_tx, ended) = tokio::sync::oneshot::channel();
     let fuse = std::thread::Builder::new()
         .name("rview-fuse".into())

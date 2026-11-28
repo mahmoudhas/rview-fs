@@ -249,3 +249,22 @@ fn the_deletions_a_listing_has_leave_the_index_with_it_to_be_freed_later() {
     assert_eq!(ix.deleted[&a].len(), 1);
     assert_eq!(ix.file_count(), 0);
 }
+
+#[test]
+fn a_file_no_node_holds_anymore_and_the_folders_it_leaves_empty_are_noted_once_asked_for() {
+    let mut ix = Index::new();
+    ix.add(&node("a"), &path("d/e/x.bin"), stat(4));
+    ix.add(&node("a"), &path("k/y.bin"), stat(4));
+    ix.add(&node("b"), &path("k/y.bin"), stat(4));
+    ix.remove(&node("a"), &path("d/e/x.bin"));
+    assert!(ix.take_gone().is_empty(), "nobody asked");
+    ix.add(&node("a"), &path("d/e/x.bin"), stat(4));
+    ix.note_gone();
+    ix.delete(&node("a"), &path("d/e/x.bin"));
+    assert_eq!(ix.take_gone(), ["d/e/x.bin", "d/e", "d"]);
+    // Another node holds it still.
+    ix.delete(&node("a"), &path("k/y.bin"));
+    assert!(ix.take_gone().is_empty());
+    ix.remove_node(&node("b"));
+    assert_eq!(ix.take_gone(), ["k/y.bin", "k"]);
+}

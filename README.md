@@ -75,6 +75,9 @@ the other had already, not only those announced since.
   a part, 25 s of the minute in which the machines are listed: programs opened an eighth
   of the files they opened before and after. What the machine announces between two
   parts stands.
+- The kernel is told of every file and folder that goes, so it drops the name and forgets
+  the inode, and rview-fs the inode's path. Untold, it remembers a name nobody asks for
+  again until it is short of memory, and both grew with every file ever opened.
 - A listing is held in two pieces of memory whatever its size, its paths in one, and both
   go back to the kernel once it is in. Held as a string a path, the memory of 400,000
   paths of 1 kB stayed with the allocator after every listing: in a group of three

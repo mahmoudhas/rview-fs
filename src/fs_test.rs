@@ -287,6 +287,56 @@ async fn opening_a_file_of_another_node_from_memory_notes_it_for_its_node() {
     assert!(noted[&key.node].contains(&key.path));
 }
 
+/// The next message `forget_gone` wrote for the kernel: the inode of the folder and the
+/// name in it that it is to drop.
+fn told(kernel: &mut impl io::Read) -> (u64, String) {
+    use fractal_fuse::abi::{
+        FUSE_NOTIFY_INVAL_ENTRY, fuse_notify_inval_entry_out, fuse_out_header,
+    };
+    let word = |bytes: &[u8]| u64::from_ne_bytes(bytes.try_into().unwrap());
+    let mut header = [0; size_of::<fuse_out_header>()];
+    kernel.read_exact(&mut header).unwrap();
+    let len = u32::from_ne_bytes(header[..4].try_into().unwrap()) as usize;
+    assert_eq!(
+        i32::from_ne_bytes(header[4..8].try_into().unwrap()),
+        FUSE_NOTIFY_INVAL_ENTRY
+    );
+    let mut rest = vec![0; len - header.len()];
+    kernel.read_exact(&mut rest).unwrap();
+    let (entry, name) = rest.split_at(size_of::<fuse_notify_inval_entry_out>());
+    let name = name.strip_suffix(&[0]).expect("a name ends with a NUL");
+    (word(&entry[..8]), String::from_utf8(name.to_vec()).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kernel_is_told_of_a_file_gone_and_of_its_folder_when_it_holds_their_inodes() {
+    let files = ["d/held.bin".to_owned(), "d/never.bin".to_owned()];
+    let (state, fs) = union_of(&files).await;
+    // The kernel looked d up, and one of its two files.
+    let d = fs.lookup(REQUEST, ROOT, OsStr::new("d")).await.unwrap();
+    let d = InodeId(d.attr.ino);
+    fs.lookup(REQUEST, d, OsStr::new("held.bin")).await.unwrap();
+    let (mut kernel, ours) = io::pipe().unwrap();
+    let cancel = CancellationToken::new();
+    let notifier = FuseNotifier::from(Arc::new(std::os::fd::OwnedFd::from(ours)));
+    let telling = tokio::spawn(fs.forget_gone(notifier, cancel.clone()));
+    // Until it has asked the index to note what goes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    remove(&state, "d/never.bin");
+    remove(&state, "d/held.bin");
+    let heard = tokio::task::spawn_blocking(move || [told(&mut kernel), told(&mut kernel)]);
+    let heard = tokio::time::timeout(Duration::from_secs(10), heard)
+        .await
+        .expect("told within its interval")
+        .unwrap();
+    assert_eq!(
+        heard,
+        [(d.0, "held.bin".to_owned()), (ROOT.0, "d".to_owned())]
+    );
+    cancel.cancel();
+    telling.await.unwrap().unwrap();
+}
+
 /// A request as the kernel writes it to /dev/fuse: its header, then `body`.
 fn request(opcode: u32, nodeid: u64, body: &[u64]) -> Vec<u8> {
     let len = (size_of::<fuse_in_header>() + 8 * body.len()) as u32;

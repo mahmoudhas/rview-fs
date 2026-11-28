@@ -2,7 +2,26 @@ use std::time::Duration;
 
 use clap::CommandFactory as _;
 
-use super::{Args, leave_while_detaching};
+use super::{Args, leave_while_detaching, list_once_joined};
+
+#[tokio::test]
+async fn the_other_machines_hear_of_this_one_before_it_lists_its_export() {
+    let joined = std::cell::Cell::new(false);
+    // A listing that says whether the others had heard of this machine when it began.
+    let heard_first = list_once_joined(
+        || {
+            joined.set(true);
+            Ok(())
+        },
+        async { Ok(joined.get()) },
+    )
+    .await
+    .unwrap();
+    assert!(
+        heard_first,
+        "the export was listed before the others heard of this machine"
+    );
+}
 
 #[tokio::test]
 async fn the_other_machines_are_left_while_the_unmount_still_runs() {

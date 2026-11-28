@@ -54,9 +54,11 @@ leaves it open:
 
 ### Machines that go down and come back up
 
-A machine that comes up, new or back, heartbeats at once. Every rview-fs that hears it
-lists its export whole, and heartbeats back so that it lists theirs: each gets the files
-the other had already, not only those announced since.
+A machine that comes up, new or back, heartbeats at once, before it lists its own export:
+from then it opens the files on its disk for the others, and its mount appears once its
+export is listed. Every rview-fs that hears it lists its export whole, and heartbeats back
+so that it lists theirs: each gets the files the other had already, not only those
+announced since.
 
 - A listing that fails, of a machine not reachable yet or too busy to answer, is made
   again 1 s later, and twice as long after each time since, up to 30 s, until the machine

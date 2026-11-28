@@ -133,6 +133,18 @@ async fn leave_while_detaching<T: Send + 'static>(
     detaching.await
 }
 
+/// List our export, with `list`, once `join` has told the other machines of this one and
+/// serves them. Not the listing first: a big export takes a minute to list, and for that
+/// long on top of its restart the others would go without the files of a machine that
+/// restarted, and drop them once it has been silent too long.
+async fn list_once_joined<T>(
+    join: impl FnOnce() -> anyhow::Result<()>,
+    list: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    join()?;
+    list.await
+}
+
 /// Detach the mount at `mount`, lazily: whoever still reads it may finish, and nothing
 /// new finds it.
 fn detach(mount: &Path) -> std::io::Result<std::process::ExitStatus> {
@@ -330,23 +342,33 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let files = nats.subscribe(sync::files_subject(&subject)).await?;
     let nodes = nats.subscribe(sync::nodes_subject(&subject)).await?;
     nats.flush().await?;
-    sync::scan_local(&state).await?;
 
     let cancel = CancellationToken::new();
     let mut tasks = JoinSet::new();
     let stages = Arc::new(transfer::Stages::new(
         (args.stage_gib * f64::from(1u32 << 30)) as u64,
     ));
-    // Before the first heartbeat (watch_nodes): a node that hears it lists this one at
-    // once, and a listing that finds no handler fails.
-    transfer::serve(
-        &velo,
-        args.export.clone(),
-        pinned,
-        Arc::clone(&stages),
-        Arc::clone(&held),
-    )?;
-    tasks.spawn(transfer::reap(velo.clone(), stages, held, cancel.clone()));
+    let join = || {
+        // Before the first heartbeat (watch_nodes): a node that hears it lists this one
+        // at once, and a listing that finds no handler fails.
+        transfer::serve(
+            &velo,
+            args.export.clone(),
+            pinned,
+            Arc::clone(&stages),
+            Arc::clone(&held),
+        )?;
+        tasks.spawn(transfer::reap(velo.clone(), stages, held, cancel.clone()));
+        tasks.spawn(sync::watch_nodes(
+            nats,
+            subject.clone(),
+            nodes,
+            Arc::clone(&state),
+            cancel.clone(),
+        ));
+        Ok(())
+    };
+    list_once_joined(join, sync::scan_local(&state)).await?;
     tasks.spawn(remote::renew(Arc::clone(&state), cancel.clone()));
     tasks.spawn(used::tell(Arc::clone(&state), cancel.clone()));
     tasks.spawn(sync::rescan(
@@ -370,13 +392,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let stop_reminding = cancel.clone();
     tasks.spawn(async move { reminding.remind(stop_reminding).await });
     tasks.spawn(sync::watch_files(files, Arc::clone(&state), cancel.clone()));
-    tasks.spawn(sync::watch_nodes(
-        nats,
-        subject.clone(),
-        nodes,
-        Arc::clone(&state),
-        cancel.clone(),
-    ));
 
     let options = MountOptions::new()
         .fs_name("rview-fs")

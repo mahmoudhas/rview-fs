@@ -76,6 +76,35 @@ fn a_listing_does_not_bring_back_a_file_deleted_since_it_was_requested() {
     assert_eq!(names(&ix, ""), ["x.bin", "y.bin"].map(str::to_owned));
 }
 
+#[test]
+fn a_file_announced_since_its_listing_was_requested_stays_whatever_its_time() {
+    // A new name of an older file has that file's time, and the kernel gives a file the
+    // time of its clock's last tick: both can be older than a listing that was taken
+    // before they were there.
+    let a = node("a");
+    let listing = vec![(path("d/other-size.bin"), stat(1))];
+    for most in [1, 1000] {
+        let mut ix = Index::new();
+        ix.add(&a, &path("gone.bin"), stat(1));
+        ix.add(&a, &path("d/other-size.bin"), stat(1));
+        let requested = ix.mark();
+        // Announced while the listing was on its way, with times before it was taken.
+        ix.add(&a, &path("linked.bin"), stat(1));
+        ix.add(&a, &path("d/other-size.bin"), stat(7));
+        let mut replacement = Replacement::new(&a, listing.clone().into(), 10.0, requested);
+        while ix.replace_part(&mut replacement, most) {}
+        let kept = [
+            ("d/other-size.bin".to_owned(), vec![(a.clone(), 7, 1.0)]),
+            ("linked.bin".to_owned(), vec![(a.clone(), 1, 1.0)]),
+        ];
+        assert_eq!(files(&ix), kept, "in parts of {most}");
+        // A listing requested after the announcement lacks the file only when it is gone.
+        ix.replace_node(&a, listing.clone().into(), 20.0, ix.mark());
+        let listed = [("d/other-size.bin".to_owned(), vec![(a.clone(), 1, 1.0)])];
+        assert_eq!(files(&ix), listed, "in parts of {most}");
+    }
+}
+
 /// A file of the union: its path, and the nodes that hold it with the size and time each
 /// says.
 type Held = (String, Vec<(NodeId, u64, f64)>);
@@ -90,7 +119,9 @@ fn files(index: &Index) -> Vec<Held> {
                 EntryKind::Dir => folders.push(child),
                 EntryKind::File => {
                     let sources = &index.dirs[dir.as_str()].files[&name];
-                    let nodes = sources.iter().map(|(n, s)| (n.clone(), s.size, s.mtime));
+                    let nodes = sources
+                        .iter()
+                        .map(|(n, k)| (n.clone(), k.stat.size, k.stat.mtime));
                     found.push((child, nodes.collect()));
                 }
             }

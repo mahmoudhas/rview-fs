@@ -48,9 +48,17 @@ pub enum EntryKind {
     File,
 }
 
+/// A file as one node has it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Known {
+    stat: Stat,
+    /// When on `Index::clock` the node last announced it; 0 when only a listing had it.
+    announced: u64,
+}
+
 #[derive(Default)]
 struct Dir {
-    files: BTreeMap<String, BTreeMap<NodeId, Stat>>,
+    files: BTreeMap<String, BTreeMap<NodeId, Known>>,
     dirs: BTreeSet<String>,
 }
 
@@ -63,7 +71,7 @@ impl Dir {
 pub struct Index {
     /// In order, so that a listing's sweep reads on from the folder it stopped at.
     dirs: BTreeMap<String, Dir>,
-    /// Counts the deletions announced, which `mark` reads.
+    /// Counts the files and the deletions announced, which `mark` reads.
     clock: u64,
     /// The files whose deletion was announced, by node, and when on `clock`: a listing
     /// requested before then may still have them.
@@ -265,6 +273,14 @@ impl Replacement {
         }
         false
     }
+
+    /// Whether the node wrote or announced `known` since the listing: it was announced
+    /// since the listing was requested, or its time is after the listing was taken. The
+    /// time alone does not tell: a new name of an older file has that file's time, and
+    /// the kernel gives a file the time of its clock's last tick, some milliseconds old.
+    fn is_since(&self, known: &Known) -> bool {
+        known.announced > self.requested || known.stat.mtime >= self.listed_at
+    }
 }
 
 /// The most paths gone that are kept for `take_gone`: a node that goes takes every file
@@ -326,21 +342,24 @@ impl Index {
         self.remove(node, path);
     }
 
+    /// A file `node` announced it has.
     pub fn add(&mut self, node: &NodeId, path: &RelPath, stat: Stat) {
+        self.clock += 1;
         if let Some(deleted) = self.deleted.get_mut(node) {
             deleted.remove(path);
         }
         let (dir, name) = path.split();
-        self.insert(node, dir, name, stat);
+        let announced = self.clock;
+        self.insert(node, dir, name, Known { stat, announced });
     }
 
-    fn insert(&mut self, node: &NodeId, dir: &str, name: &str, stat: Stat) {
+    fn insert(&mut self, node: &NodeId, dir: &str, name: &str, known: Known) {
         self.ensure_dir(dir);
         self.dir_mut(dir)
             .files
             .entry(name.to_owned())
             .or_default()
-            .insert(node.clone(), stat);
+            .insert(node.clone(), known);
     }
 
     pub fn remove(&mut self, node: &NodeId, path: &RelPath) {
@@ -372,9 +391,9 @@ impl Index {
     }
 
     /// Make `node`'s files those of a listing it took at `listed_at`, which we requested
-    /// at `requested` (a `mark`), keeping the files written since, which it announced
-    /// after the listing was taken, and not taking back the ones it announced deleted
-    /// since we requested it.
+    /// at `requested` (a `mark`), keeping the files it announced since we requested it
+    /// and those written since it was taken, and not taking back the ones it announced
+    /// deleted since we requested it.
     pub fn replace_node(&mut self, node: &NodeId, files: Files, listed_at: f64, requested: u64) {
         let mut replacement = Replacement::new(node, files, listed_at, requested);
         while self.replace_part(&mut replacement, usize::MAX) {}
@@ -403,7 +422,7 @@ impl Index {
 
     /// Remove the files `r`'s node no longer has, from where the sweep stands on, looking
     /// at no more than `left` files and folders; false once every folder is swept. A file
-    /// written since the listing was taken stays.
+    /// announced or written since the listing stays.
     fn sweep(&mut self, r: &mut Replacement, left: &mut usize) -> bool {
         let stood = std::mem::replace(&mut r.swept, Swept::All);
         let from = match &stood {
@@ -430,9 +449,7 @@ impl Index {
             };
             let mut stopped = None;
             for (name, sources) in names {
-                if sources
-                    .get(&r.node)
-                    .is_some_and(|stat| stat.mtime < r.listed_at)
+                if sources.get(&r.node).is_some_and(|known| !r.is_since(known))
                     && !r.lists(dir, name)
                 {
                     stale.push(join(dir, name));
@@ -462,9 +479,9 @@ impl Index {
     }
 
     /// Put the next files of `r`'s listing in, no more than `left` of them, once the sweep
-    /// is done: those the index does not have as listed, unless the node announced them
-    /// since. The listing and the folders are both in order, so the folders are read on
-    /// beside the listing, and one is searched for only when it is far on.
+    /// is done: those the index does not have as listed, unless the node announced or
+    /// wrote them since. The listing and the folders are both in order, so the folders are
+    /// read on beside the listing, and one is searched for only when it is far on.
     fn add_listed(&mut self, r: &mut Replacement, left: &mut usize) {
         if !matches!(r.swept, Swept::All) {
             return;
@@ -498,7 +515,7 @@ impl Index {
                 .filter(|(folder, _)| folder.as_str() == dir)
                 .and_then(|(_, folder)| folder.files.get(name))
                 .and_then(|sources| sources.get(&r.node));
-            if !known.is_some_and(|known| *known == listed.stat || known.mtime >= r.listed_at) {
+            if !known.is_some_and(|known| known.stat == listed.stat || r.is_since(known)) {
                 unknown.push(listed);
             }
             r.added += 1;
@@ -511,7 +528,11 @@ impl Index {
                 .and_then(|deleted| deleted.get(listed.path))
                 .is_some_and(|&at| at > r.requested);
             if !deleted_since {
-                self.insert(&r.node, listed.dir, listed.name, listed.stat);
+                let known = Known {
+                    stat: listed.stat,
+                    announced: 0,
+                };
+                self.insert(&r.node, listed.dir, listed.name, known);
             }
         }
     }
@@ -524,8 +545,8 @@ impl Index {
         let sources = self.dirs.get(dir)?.files.get(name)?;
         Some(Entry::File(FileView {
             path: RelPath::parse(path)?,
-            size: sources.values().next()?.size,
-            mtime: sources.values().map(|s| s.mtime).reduce(f64::max)?,
+            size: sources.values().next()?.stat.size,
+            mtime: sources.values().map(|k| k.stat.mtime).reduce(f64::max)?,
             nodes: sources.keys().cloned().collect(),
         }))
     }

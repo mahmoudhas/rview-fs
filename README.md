@@ -81,6 +81,12 @@ announced since.
   a part, 25 s of the minute in which the machines are listed: programs opened an eighth
   of the files they opened before and after. What the machine announces between two
   parts stands.
+- A listing leaves alone what its machine announced after the listing was asked: a file
+  it lacks came after its walk passed, and one it has may have been written anew since.
+  The file's time does not tell that: the kernel gives a file the time of its clock's
+  last tick, some milliseconds old, and a new name of an older file has that file's time.
+  Told by the time alone, a file written as its machine was listed was taken out again,
+  and missing until the next listing.
 - The kernel is told of every file and folder that goes, so it drops the name and forgets
   the inode, and rview-fs the inode's path. Untold, it remembers a name nobody asks for
   again until it is short of memory, and both grew with every file ever opened.

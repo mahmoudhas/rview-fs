@@ -7,7 +7,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
 use parking_lot::Mutex;
 use prometheus::{IntCounterVec, Opts, Registry};
 use tokio_util::sync::CancellationToken;
@@ -17,7 +16,7 @@ use crate::cache::Key;
 use crate::held::RENEW_EVERY;
 use crate::index::NodeId;
 use crate::state::State;
-use crate::transfer::{self, Opened};
+use crate::transfer;
 
 /// The handles this node has open, by the node's rview-fs that holds them.
 #[derive(Default)]
@@ -157,24 +156,12 @@ impl RemoteFile {
         key: Key,
         runtime: tokio::runtime::Handle,
     ) -> anyhow::Result<Option<Self>> {
-        let instance = state
-            .nodes
-            .read()
-            .instance(&key.node)
-            .ok_or_else(|| anyhow!("node {} is not up", key.node.as_str()))?;
-        let Some(Opened { handle, size }) =
-            transfer::open(&state.velo, instance, &key.path).await?
-        else {
+        let Some(remote) = state.open_remote(&key).await? else {
             return Ok(None);
         };
-        state.remote.add(instance, handle);
+        state.remote.add(remote.instance, remote.handle);
         Ok(Some(Self {
-            remote: Remote {
-                key,
-                instance,
-                handle,
-                size,
-            },
+            remote,
             state,
             runtime,
         }))

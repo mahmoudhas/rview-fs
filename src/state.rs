@@ -2,16 +2,16 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use velo::Velo;
 
-use crate::cache::ContentCache;
+use crate::cache::{ContentCache, Key};
 use crate::index::{Index, NodeId};
 use crate::remote::{Remote, RemoteFiles, Stalls, TCP_AFTER_STALL, Via};
 use crate::sync::Nodes;
-use crate::transfer;
+use crate::transfer::{self, Opened};
 use crate::used::Used;
 
 pub struct State {
@@ -42,7 +42,7 @@ impl State {
     /// was read before.
     pub async fn remote_content(&self, remote: &Remote) -> anyhow::Result<Bytes> {
         self.cache
-            .get_or_fetch(&remote.key, || self.fetch(remote))
+            .get_or_fetch(&remote.key, || self.fetch_held(remote))
             .await
             .with_context(|| {
                 format!(
@@ -51,6 +51,64 @@ impl State {
                     remote.key.node.as_str()
                 )
             })
+    }
+
+    /// Have the node `key` names open its file for us, and hold it open until we close
+    /// it. None when it does not have it (anymore). A node that restarts with the call in
+    /// hand never answers it: the node as it is up then is asked, at once.
+    pub async fn open_remote(&self, key: &Key) -> anyhow::Result<Option<Remote>> {
+        loop {
+            let up = self.nodes.read().up(&key.node);
+            let (instance, gone) =
+                up.ok_or_else(|| anyhow!("node {} is not up", key.node.as_str()))?;
+            let opened = tokio::select! {
+                opened = transfer::open(&self.velo, instance, &key.path) => opened?,
+                () = gone.cancelled() => continue,
+            };
+            return Ok(opened.map(|Opened { handle, size }| Remote {
+                key: key.clone(),
+                instance,
+                handle,
+                size,
+            }));
+        }
+    }
+
+    /// The file `remote`, from the node that holds it open for us. When that node
+    /// restarted, before the fetch or under it, what it held went with it and it never
+    /// answers: the node as it is up now opens the file anew, for this fetch. A node that
+    /// only went silent may still answer, and is waited for as long as a call is.
+    async fn fetch_held(&self, remote: &Remote) -> anyhow::Result<Bytes> {
+        let node = &remote.key.node;
+        let up = self.nodes.read().up(node);
+        match up {
+            Some((instance, gone)) if instance == remote.instance => {
+                let fetching = self.fetch(remote);
+                tokio::pin!(fetching);
+                tokio::select! {
+                    fetched = &mut fetching => return fetched,
+                    () = gone.cancelled() => {}
+                }
+                if self.nodes.read().up(node).is_none() {
+                    return fetching.await;
+                }
+            }
+            // Up as another instance: it restarted since it opened the file.
+            Some(_) => {}
+            None => return self.fetch(remote).await,
+        }
+        let again = self
+            .open_remote(&remote.key)
+            .await?
+            .ok_or_else(|| anyhow!("its node restarted and has it no more"))?;
+        let fetched = self.fetch(&again).await;
+        let velo = self.velo.clone();
+        tokio::spawn(async move {
+            if let Err(e) = transfer::close(&velo, again.instance, again.handle).await {
+                tracing::debug!("closing a file opened anew for a fetch failed: {e:#}");
+            }
+        });
+        fetched
     }
 
     /// A file another node holds open for us: over RDMA, unless reading one of its files

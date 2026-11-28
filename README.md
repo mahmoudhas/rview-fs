@@ -63,6 +63,10 @@ the other had already, not only those announced since.
   answers, goes, or restarts. rview-fs answers listings before it first heartbeats.
 - A machine that restarts within 30 s keeps the files it had until its listing replaces
   them; one silent for 30 s is gone, and so are its files, until it comes back.
+- A machine killed with an open or a read of one of its files in hand never answers it.
+  When it is up again the open is asked of it anew and the file fetched from it, at once;
+  when it stays away the call ends as the machine is taken for gone, after 30 s, or after
+  the 60 s a call waits at the most.
 - A listing that answers after its machine went or restarted is dropped: it brings back no
   files of a machine gone.
 - A machine that heartbeats an address velo cannot use is left out, and said so at each

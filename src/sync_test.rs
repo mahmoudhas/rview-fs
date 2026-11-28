@@ -9,6 +9,7 @@ use crate::held::Held;
 use crate::index::{Entry, EntryKind};
 use crate::remote::{Remote, RemoteFile};
 use crate::state::testing::{state, state_of, velo};
+use crate::transfer::tests::never_answering;
 
 #[test]
 fn hidden_files_being_written_are_not_taken() {
@@ -253,4 +254,125 @@ async fn a_file_nobody_announced_is_listed_once_nats_is_back() {
         .expect("listed once NATS was back");
     cancel.cancel();
     rescans.await.unwrap().unwrap();
+}
+
+#[test]
+fn what_waits_on_a_node_is_told_when_it_restarts_or_goes_and_not_at_a_heartbeat() {
+    let mut nodes = Nodes::default();
+    let b = NodeId::parse("b").unwrap();
+    let (first, second) = (InstanceId::new_v4(), InstanceId::new_v4());
+    assert_eq!(nodes.heard(b.clone(), first), Heard::New);
+    let (instance, gone) = nodes.up(&b).unwrap();
+    assert_eq!(nodes.heard(b.clone(), first), Heard::Again);
+    assert!(instance == first && !gone.is_cancelled());
+    assert_eq!(nodes.heard(b.clone(), second), Heard::Restarted(first));
+    assert!(gone.is_cancelled());
+    let (instance, gone) = nodes.up(&b).unwrap();
+    assert!(instance == second && !gone.is_cancelled());
+    nodes.forget(&b);
+    assert!(gone.is_cancelled() && nodes.up(&b).is_none());
+    // Silent for too long.
+    nodes.heard(b.clone(), second);
+    let (_, gone) = nodes.up(&b).unwrap();
+    nodes.peers.get_mut(&b).unwrap().seen = Instant::now().checked_sub(2 * NODE_TTL).unwrap();
+    assert_eq!(nodes.expire(), vec![(b.clone(), second)]);
+    assert!(gone.is_cancelled());
+}
+
+/// `b`, up as an instance that never answers, is up again as `again`: what `watch_nodes`
+/// does at the heartbeat that says so.
+fn restarts(state: &State, b: &NodeId, again: &Velo) {
+    state.velo.register_peer(again.peer_info()).unwrap();
+    let heard = state.nodes.write().heard(b.clone(), again.instance_id());
+    assert!(matches!(heard, Heard::Restarted(_)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_a_killed_node_never_answers_is_answered_by_the_node_once_it_is_up_again() {
+    let export = export_of_one_file();
+    let (ours, killed, again) = (velo().await, never_answering().await, velo().await);
+    serve(&again, export.path());
+    ours.register_peer(killed.peer_info()).unwrap();
+    let state = state(ours);
+    let b = NodeId::parse("b").unwrap();
+    state.nodes.write().heard(b.clone(), killed.instance_id());
+    let key = Key {
+        node: b.clone(),
+        path: RelPath::parse("x.bin").unwrap(),
+    };
+    let open = || {
+        let (state, key) = (Arc::clone(&state), key.clone());
+        tokio::spawn(async move { state.open_remote(&key).await })
+    };
+    let opening = open();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!opening.is_finished(), "it waits for its answer");
+    restarts(&state, &b, &again);
+    let opened = tokio::time::timeout(Duration::from_secs(10), opening)
+        .await
+        .expect("the node as it is up now answers")
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!((opened.instance, opened.size), (again.instance_id(), 4));
+    // One that waits while the node goes for good ends then, and not a minute later.
+    state.nodes.write().heard(b.clone(), killed.instance_id());
+    let opening = open();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!opening.is_finished(), "it waits for its answer");
+    state.nodes.write().forget(&b);
+    let failed = tokio::time::timeout(Duration::from_secs(10), opening)
+        .await
+        .expect("ended when the node went")
+        .unwrap();
+    assert!(format!("{:#}", failed.unwrap_err()).contains("is not up"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_held_by_a_node_that_restarted_is_read_from_the_node_as_it_is_up_now() {
+    let export = export_of_one_file();
+    std::fs::write(export.path().join("y.bin"), b"56").unwrap();
+    let (ours, killed, again) = (velo().await, never_answering().await, velo().await);
+    serve(&again, export.path());
+    ours.register_peer(killed.peer_info()).unwrap();
+    let state = state(ours);
+    let b = NodeId::parse("b").unwrap();
+    state.nodes.write().heard(b.clone(), killed.instance_id());
+    // Open on the instance that then never answers: its handles went with it.
+    let held = |path, size| Remote {
+        key: Key {
+            node: b.clone(),
+            path: RelPath::parse(path).unwrap(),
+        },
+        instance: killed.instance_id(),
+        handle: 7,
+        size,
+    };
+    // It restarts under the fetch.
+    let reading = tokio::spawn({
+        let (state, held) = (Arc::clone(&state), held("x.bin", 4));
+        async move { state.remote_content(&held).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!reading.is_finished(), "it waits for its answer");
+    restarts(&state, &b, &again);
+    let read = tokio::time::timeout(Duration::from_secs(10), reading)
+        .await
+        .expect("the node as it is up now is asked")
+        .unwrap()
+        .unwrap();
+    assert_eq!(&read[..], b"1234");
+    // It restarted before the fetch.
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        state.remote_content(&held("y.bin", 2)),
+    )
+    .await
+    .expect("the instance that went is not asked")
+    .unwrap();
+    assert_eq!(&read[..], b"56");
+    // What its successor does not have fails, and says whose.
+    let gone = state.remote_content(&held("gone.bin", 1)).await;
+    let said = format!("{:#}", gone.unwrap_err());
+    assert!(said.contains("gone.bin of b") && said.contains("has it no more"));
 }

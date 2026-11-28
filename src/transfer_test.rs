@@ -1,6 +1,20 @@
 use super::*;
 use crate::used::tests::{age, is_marked};
 
+/// A node that takes an open or a fetch and never answers it, as one killed with the call
+/// in hand.
+pub(crate) async fn never_answering() -> Velo {
+    let velo = crate::state::testing::velo().await;
+    let never =
+        |_: TypedContext<OpenRequest>| std::future::pending::<anyhow::Result<Option<Opened>>>();
+    let open = Handler::typed_unary_async(OPEN, never).build();
+    velo.register_handler(open).unwrap();
+    let never = |_: TypedContext<FetchRequest>| std::future::pending::<anyhow::Result<Staged>>();
+    let fetch = Handler::typed_unary_async(FETCH, never).build();
+    velo.register_handler(fetch).unwrap();
+    velo
+}
+
 #[test]
 fn a_scan_lists_only_the_visible_files() {
     let dir = tempfile::tempdir().unwrap();

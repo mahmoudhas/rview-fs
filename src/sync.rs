@@ -73,6 +73,24 @@ enum Op {
 struct Peer {
     instance: InstanceId,
     seen: Instant,
+    /// Cancelled once the node is not up as this instance anymore.
+    gone: CancellationToken,
+}
+
+impl Peer {
+    fn new(instance: InstanceId, seen: Instant) -> Self {
+        Self {
+            instance,
+            seen,
+            gone: CancellationToken::new(),
+        }
+    }
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.gone.cancel();
+    }
 }
 
 /// What a heartbeat tells of its node.
@@ -97,6 +115,13 @@ impl Nodes {
         self.peers.get(node).map(|p| p.instance)
     }
 
+    /// The instance `node` is up as, and what is cancelled once it is not up as that one
+    /// anymore: it restarted, or went. A call that instance has not answered by then is
+    /// never answered.
+    pub fn up(&self, node: &NodeId) -> Option<(InstanceId, CancellationToken)> {
+        self.peers.get(node).map(|p| (p.instance, p.gone.clone()))
+    }
+
     pub fn len(&self) -> usize {
         self.peers.len()
     }
@@ -108,10 +133,19 @@ impl Nodes {
     /// Note a heartbeat.
     pub(crate) fn heard(&mut self, node: NodeId, instance: InstanceId) -> Heard {
         let seen = Instant::now();
-        match self.peers.insert(node, Peer { instance, seen }) {
-            None => Heard::New,
-            Some(was) if was.instance == instance => Heard::Again,
-            Some(was) => Heard::Restarted(was.instance),
+        match self.peers.get_mut(&node) {
+            Some(peer) if peer.instance == instance => {
+                peer.seen = seen;
+                Heard::Again
+            }
+            Some(peer) => {
+                let was = std::mem::replace(peer, Peer::new(instance, seen));
+                Heard::Restarted(was.instance)
+            }
+            None => {
+                self.peers.insert(node, Peer::new(instance, seen));
+                Heard::New
+            }
         }
     }
 
@@ -228,22 +262,28 @@ pub async fn watch_nodes(
                     continue;
                 }
                 let instance = heartbeat.peer.instance_id;
-                let heard = state.nodes.write().heard(node.clone(), instance);
-                match heard {
-                    Heard::Again => continue,
-                    Heard::New => tracing::info!(node = node.as_str(), "node up; listing its files"),
-                    Heard::Restarted(was) => {
-                        tracing::info!(node = node.as_str(), "node restarted; listing its files");
-                        // Velo keeps what it has of an instance until told it is gone.
-                        state.velo.unregister_peer(was);
-                    }
+                if state.nodes.read().instance(&node) == Some(instance) {
+                    state.nodes.write().heard(node, instance);
+                    continue;
                 }
+                // Before it is noted: what waits on the instance it was is asked of this
+                // one the moment it is, and velo has to know it by then.
                 if let Err(e) = state.velo.register_peer(heartbeat.peer) {
                     // Left out, as though gone, until it heartbeats an address velo can use.
                     tracing::warn!(node = node.as_str(), "a node came up at an address velo cannot use: {e:#}");
                     state.nodes.write().forget(&node);
                     state.index.write().remove_node(&node);
                     continue;
+                }
+                let heard = state.nodes.write().heard(node.clone(), instance);
+                match heard {
+                    Heard::Again => {}
+                    Heard::New => tracing::info!(node = node.as_str(), "node up; listing its files"),
+                    Heard::Restarted(was) => {
+                        tracing::info!(node = node.as_str(), "node restarted; listing its files");
+                        // Velo keeps what it has of an instance until told it is gone.
+                        state.velo.unregister_peer(was);
+                    }
                 }
                 listings.spawn(list_until_listed(Arc::clone(&state), node, instance));
                 // So that it knows us now, and not only at our next heartbeat.

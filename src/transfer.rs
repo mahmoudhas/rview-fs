@@ -698,4 +698,4 @@ pub async fn renew(velo: &Velo, instance: InstanceId, open: Vec<u64>) -> anyhow:
 
 #[cfg(test)]
 #[path = "transfer_test.rs"]
-mod tests;
+pub(crate) mod tests;

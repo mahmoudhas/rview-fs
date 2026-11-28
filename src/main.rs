@@ -83,6 +83,11 @@ struct Args {
     /// and every one gets this many 1 MiB buffers before the mount serves all CPUs.
     #[arg(long, default_value_t = 8)]
     fuse_queue_depth: u16,
+    /// Reads the kernel has in flight on the mount at the most, for all who read through
+    /// it together (FUSE's max_background); a further read waits for one to end. A read of
+    /// another machine's file not fetched yet is in flight for as long as the fetch takes.
+    #[arg(long, default_value_t = rview_fs::fs::READS_IN_FLIGHT, value_parser = clap::value_parser!(u16).range(1..))]
+    fuse_max_background: u16,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -387,7 +392,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Arc::clone(&state),
         tokio::runtime::Handle::current(),
         passthrough.clone(),
-    );
+    )
+    .with_reads_in_flight(args.fuse_max_background);
     fs.register(&registry)?;
     fs.read_forgets(session.fuse_fd(), args.mount.clone())?;
     tasks.spawn(fs.forget_gone(FuseNotifier::from(session.fuse_fd()), cancel.clone()));

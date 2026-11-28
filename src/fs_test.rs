@@ -221,6 +221,23 @@ async fn a_folder_first_read_from_further_in_is_read_from_a_listing_taken_then()
 }
 
 #[tokio::test]
+async fn the_kernel_is_told_how_many_reads_it_may_have_in_flight() {
+    let (_state, fs) = union_of(&[]).await;
+    let as_it_comes = fs.init(REQUEST).await.unwrap();
+    assert_eq!(
+        (as_it_comes.max_background, as_it_comes.congestion_threshold),
+        (16, 12)
+    );
+    let set = fs.with_reads_in_flight(128).init(REQUEST).await.unwrap();
+    assert_eq!((set.max_background, set.congestion_threshold), (128, 96));
+    // What a request may carry is left as it was.
+    assert_eq!(set.max_write, as_it_comes.max_write);
+    let (_state, fs) = union_of(&[]).await;
+    let one = fs.with_reads_in_flight(1).init(REQUEST).await.unwrap();
+    assert_eq!((one.max_background, one.congestion_threshold), (1, 1));
+}
+
+#[tokio::test]
 async fn each_call_of_the_kernel_is_timed_by_its_name() {
     let (state, fs) = union_of(&["a.bin".to_owned()]).await;
     assert_eq!(state.ops.count("lookup"), 0);

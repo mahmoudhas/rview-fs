@@ -45,8 +45,8 @@ use fractal_fuse::abi::{
 };
 use fractal_fuse::{
     DirectoryEntry, DirectoryEntryPlus, EIO, EISDIR, ENOENT, Errno, FileAttr, FileHandleId,
-    FileType, Filesystem, FsResult, FuseNotifier, InodeId, ReplyAttr, ReplyEntry, ReplyOpen,
-    ReplyStatfs, Request, Timestamp,
+    FileType, Filesystem, FsResult, FuseNotifier, InodeId, ReplyAttr, ReplyEntry, ReplyInit,
+    ReplyOpen, ReplyStatfs, Request, Timestamp,
 };
 use parking_lot::Mutex;
 use prometheus::{IntGauge, Registry};
@@ -72,11 +72,14 @@ const DEV_REQUEST_ROOM: usize = (1 << 20) + (1 << 16);
 const GONE_EVERY: Duration = Duration::from_millis(200);
 /// The paths looked up in `Inodes` at a time, which every request takes for a moment.
 const GONE_AT_A_TIME: usize = 64;
+/// The reads the kernel has in flight on the mount at the most, unless set otherwise.
+pub const READS_IN_FLIGHT: u16 = 16;
 
 pub struct RviewFs {
     state: Arc<State>,
     runtime: tokio::runtime::Handle,
     passthrough: Option<Arc<Passthrough>>,
+    reads_in_flight: u16,
     // Taken by every request for a moment, on fractal-fuse's threads; never across an
     // await.
     inodes: Arc<Mutex<Inodes>>,
@@ -350,10 +353,21 @@ impl RviewFs {
             state,
             runtime,
             passthrough,
+            reads_in_flight: READS_IN_FLIGHT,
             inodes: Arc::new(Mutex::new(Inodes::new())),
             open: Mutex::default(),
             dirs: Mutex::default(),
         }
+    }
+
+    /// Have the kernel keep at most `most` reads in flight on the mount, for all who read
+    /// through it together (FUSE's max_background). A read that meets a file of another
+    /// node not fetched yet stays in flight until the file is there, so a few such files
+    /// take the default up, and the readers of every other file wait behind them.
+    #[must_use]
+    pub fn with_reads_in_flight(mut self, most: u16) -> Self {
+        self.reads_in_flight = most;
+        self
     }
 
     /// Read what the kernel sends on /dev/fuse itself, `fuse`, and not through the ring,
@@ -675,6 +689,16 @@ impl RviewFs {
 }
 
 impl Filesystem for RviewFs {
+    async fn init(&self, _req: Request) -> FsResult<ReplyInit> {
+        Ok(ReplyInit {
+            max_background: self.reads_in_flight,
+            // From here on the kernel stops reading ahead of a reader: three quarters, as
+            // its own defaults are to each other.
+            congestion_threshold: (self.reads_in_flight / 4 * 3).max(1),
+            ..ReplyInit::default()
+        })
+    }
+
     async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
         let _timed = self.state.ops.time("lookup");
         let name = name.to_str().ok_or(ENOENT)?;

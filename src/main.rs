@@ -105,6 +105,19 @@ fn main() -> anyhow::Result<()> {
     outcome
 }
 
+/// Leave the other machines while `detach` unmounts, and return what it returned. Not one
+/// after the other: when no program holds a file of the mount, the kernel frees what it
+/// has cached of the mount inside the unmount, which took a minute on a machine that had
+/// read much through it, and until then the other machines would take this one for alive.
+async fn leave_while_detaching<T: Send + 'static>(
+    detach: impl FnOnce() -> T + Send + 'static,
+    leave: impl Future<Output = ()>,
+) -> Result<T, tokio::task::JoinError> {
+    let detaching = tokio::task::spawn_blocking(detach);
+    leave.await;
+    detaching.await
+}
+
 /// Detach the mount at `mount`, lazily: whoever still reads it may finish, and nothing
 /// new finds it.
 fn detach(mount: &Path) -> std::io::Result<std::process::ExitStatus> {
@@ -409,21 +422,23 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // the kernel never completes, and the workers then wait for them forever.
     tracing::info!("unmounting");
     let mount = args.mount.clone();
-    let detached = tokio::task::spawn_blocking(move || detach(&mount)).await?;
+    let detached = leave_while_detaching(move || detach(&mount), async {
+        cancel.cancel();
+        while let Some(done) = tasks.join_next().await {
+            if let Ok(Err(e)) = done {
+                tracing::warn!("a task failed while stopping: {e:#}");
+            }
+        }
+        velo.shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+            .await;
+    })
+    .await?;
     if !detached
         .as_ref()
         .is_ok_and(std::process::ExitStatus::success)
     {
         tracing::warn!(status = ?detached, "unmounting {} failed", args.mount.display());
     }
-    cancel.cancel();
-    while let Some(done) = tasks.join_next().await {
-        if let Ok(Err(e)) = done {
-            tracing::warn!("a task failed while stopping: {e:#}");
-        }
-    }
-    velo.shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
-        .await;
     // Not joined: its workers end with the process (see main).
     drop(fuse);
     outcome
@@ -479,3 +494,7 @@ fn hostname() -> anyhow::Result<String> {
         std::fs::read_to_string("/proc/sys/kernel/hostname").context("reading the host name")?;
     Ok(name.trim().to_owned())
 }
+
+#[cfg(test)]
+#[path = "main_test.rs"]
+mod tests;

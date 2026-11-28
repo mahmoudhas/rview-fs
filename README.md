@@ -168,8 +168,14 @@ UCX_NET_DEVICES=mlx5_0:1 \
 | `--no-rdma` | Move files between machines over TCP |
 
 It needs root, or `CAP_SYS_ADMIN`, `/dev/fuse` and `fusermount3`. On SIGTERM it detaches
-the mount and exits. It logs how its transfers went: `rdma/ok`, or why a file moved over
-TCP.
+the mount, leaves the other machines and exits. It logs how its transfers went: `rdma/ok`,
+or why a file moved over TCP.
+
+When no program holds a file or folder of the mount open, the kernel frees what it has
+cached of the mount before the detach returns, which takes seconds, or a minute where
+much was read through the mount. rview-fs has left the other machines by then, and exits
+when the detach returns. A program that holds the mount's folder open meanwhile takes
+that work on itself when it closes the folder, and rview-fs exits at once.
 
 With `--metrics`, any request there gets velo's metrics (`velo_*`), among them the bytes
 over TCP (`velo_transport_frame_bytes_total{transport="tcp"}`), and

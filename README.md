@@ -90,6 +90,12 @@ announced since.
 - The kernel is told of every file and folder that goes, so it drops the name and forgets
   the inode, and rview-fs the inode's path. Untold, it remembers a name nobody asks for
   again until it is short of memory, and both grew with every file ever opened.
+- rview-fs asks its own mount nothing. A call of its own to the mount that is unanswered
+  when it ends keeps a thread in the kernel, and with it the process, its ports and its
+  memory, whatever signal it is sent, until the mount's FUSE connection is aborted
+  (`/sys/fs/fuse/connections`). An rview-fs told to end within a second of its mount
+  stayed behind so: the thread that reads what the kernel forgets asked the mount for its
+  attributes before it began to read.
 - A listing is held in two pieces of memory whatever its size, its paths in one, and both
   go back to the kernel once it is in. Held as a string a path, the memory of 400,000
   paths of 1 kB stayed with the allocator after every listing: in a group of three

@@ -420,7 +420,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     )
     .with_reads_in_flight(args.fuse_max_background);
     fs.register(&registry)?;
-    fs.read_forgets(session.fuse_fd(), args.mount.clone())?;
+    fs.read_forgets(session.fuse_fd())?;
     tasks.spawn(fs.forget_gone(FuseNotifier::from(session.fuse_fd()), cancel.clone()));
     let (ended_tx, ended) = tokio::sync::oneshot::channel();
     let fuse = std::thread::Builder::new()

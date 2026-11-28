@@ -35,8 +35,8 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::FileExt as _;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fractal_fuse::abi::{
@@ -80,6 +80,8 @@ pub struct RviewFs {
     runtime: tokio::runtime::Handle,
     passthrough: Option<Arc<Passthrough>>,
     reads_in_flight: u16,
+    /// Whether the session has read the kernel's first request, INIT.
+    initialized: Arc<AtomicBool>,
     // Taken by every request for a moment, on fractal-fuse's threads; never across an
     // await.
     inodes: Arc<Mutex<Inodes>>,
@@ -354,6 +356,7 @@ impl RviewFs {
             runtime,
             passthrough,
             reads_in_flight: READS_IN_FLIGHT,
+            initialized: Arc::default(),
             inodes: Arc::new(Mutex::new(Inodes::new())),
             open: Mutex::default(),
             dirs: Mutex::default(),
@@ -371,15 +374,16 @@ impl RviewFs {
     }
 
     /// Read what the kernel sends on /dev/fuse itself, `fuse`, and not through the ring,
-    /// on a thread of its own until the mount at `mount` is gone. As of Linux 6.14 it
-    /// forgets inodes there, which nothing read: no inode was ever forgotten here, and
-    /// the path of every file ever looked up stayed in memory.
-    pub fn read_forgets(&self, fuse: Arc<OwnedFd>, mount: PathBuf) -> io::Result<()> {
-        let inodes = Arc::clone(&self.inodes);
+    /// on a thread of its own until the mount is gone. As of Linux 6.14 it forgets inodes
+    /// there, which nothing read: no inode was ever forgotten here, and the path of every
+    /// file ever looked up stayed in memory.
+    pub fn read_forgets(&self, fuse: Arc<OwnedFd>) -> io::Result<()> {
+        let (inodes, initialized) = (Arc::clone(&self.inodes), Arc::clone(&self.initialized));
         let read = move || {
-            // The first request on /dev/fuse is the session's own to read: not before
-            // the mount answers.
-            while std::fs::metadata(&mount).is_err() {
+            // The first request on /dev/fuse, INIT, is the session's own to read. Not
+            // learned by asking the mount: a call of our own that it has not answered
+            // when rview-fs ends keeps its thread in the kernel, and the process never goes.
+            while !initialized.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(100));
             }
             let mut request = vec![0u8; DEV_REQUEST_ROOM];
@@ -387,6 +391,9 @@ impl RviewFs {
                 let (fd, buf) = (fuse.as_raw_fd(), request.as_mut_ptr().cast());
                 // SAFETY: `buf` is `request`'s own memory, of the length given.
                 let read = unsafe { libc::read(fd, buf, request.len()) };
+                if read == 0 {
+                    return; // closed: /dev/fuse never reads so, another file does
+                }
                 let Ok(len) = usize::try_from(read) else {
                     match io::Error::last_os_error() {
                         // A call given up before it was read, or a signal.
@@ -690,6 +697,7 @@ impl RviewFs {
 
 impl Filesystem for RviewFs {
     async fn init(&self, _req: Request) -> FsResult<ReplyInit> {
+        self.initialized.store(true, Ordering::Release);
         Ok(ReplyInit {
             max_background: self.reads_in_flight,
             // From here on the kernel stops reading ahead of a reader: three quarters, as

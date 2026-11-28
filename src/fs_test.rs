@@ -380,6 +380,31 @@ fn the_inodes_the_kernel_forgets_are_read_from_its_request_one_or_many() {
     assert!(forgotten(&[]).is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kernels_forgets_are_read_once_the_session_has_read_its_first_request() {
+    use std::io::Write as _;
+    let (_state, fs) = union_of(&["x.bin".to_owned()]).await;
+    let x = fs.lookup(REQUEST, ROOT, OsStr::new("x.bin")).await.unwrap();
+    let held = fs.inodes.lock().held.clone();
+    let (ours, mut kernel) = io::pipe().unwrap();
+    fs.read_forgets(Arc::new(OwnedFd::from(ours))).unwrap();
+    kernel
+        .write_all(&request(FUSE_FORGET, x.attr.ino, &[1]))
+        .unwrap();
+    // The first request is the session's to read: nothing reads ahead of it, and the
+    // mount is asked nothing (none is here to ask).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(held.get(), 1);
+    fs.init(REQUEST).await.unwrap();
+    for _ in 0..100 {
+        if held.get() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(held.get(), 0, "the forget was not read");
+}
+
 #[test]
 fn an_inode_is_counted_until_every_lookup_of_it_is_forgotten() {
     let mut inodes = Inodes::new();

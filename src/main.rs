@@ -328,10 +328,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         cancel.clone(),
     ));
     if let Some(addr) = args.metrics {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("binding {addr} for metrics"))?;
-        tasks.spawn(metrics::serve(listener, registry.clone(), cancel.clone()));
+        let (registry, degraded, cancel) =
+            (registry.clone(), Arc::clone(&degraded), cancel.clone());
+        tasks.spawn(async move { metrics::serve_at(addr, registry, &degraded, cancel).await });
     }
     tasks.spawn(log_transfer_paths(
         registry.clone(),

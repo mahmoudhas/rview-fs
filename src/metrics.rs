@@ -1,5 +1,6 @@
 //! Prometheus metrics over HTTP: velo's, and rview-fs's own (transfer.rs).
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -8,9 +9,39 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+use crate::health::Degraded;
+
 /// A scraper that sends no request in this long is dropped.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_HEAD: usize = 8192;
+const BIND_EVERY: Duration = Duration::from_secs(1);
+
+/// `serve` on `addr`, once it binds. An address that is taken is tried again every
+/// second and the mount is served meanwhile: an rview-fs that was killed holds its
+/// address for as long as the kernel takes to free its memory, and the next one starts
+/// in that time.
+pub async fn serve_at(
+    addr: SocketAddr,
+    registry: Registry,
+    degraded: &Degraded,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let listener = loop {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => break listener,
+            Err(e) => degraded.report(
+                "metrics",
+                format!("binding {addr} failed, and is tried every second: {e}"),
+            ),
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            () = tokio::time::sleep(BIND_EVERY) => {}
+        }
+    };
+    degraded.restored("metrics");
+    serve(listener, registry, cancel).await
+}
 
 /// Answer every request on `listener` with all of `registry`'s metrics, whatever its
 /// path, until cancelled.

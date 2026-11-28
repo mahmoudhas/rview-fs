@@ -1,6 +1,7 @@
-//! What rview-fs runs without, because the machine does not offer it: passthrough, or
-//! RDMA. It goes on without either, slower, and says so loudly: at once, and again every
-//! ten minutes for as long as it does.
+//! What rview-fs runs without, because the machine does not offer it: passthrough, RDMA,
+//! or the address of its metrics while another process holds it. It goes on without
+//! them, slower, and says so loudly: at once, and again every ten minutes for as long as
+//! it does.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -26,6 +27,13 @@ impl Degraded {
         }
         tracing::error!("DEGRADED: {what} is not available: {why}");
         missing.insert(what, why);
+    }
+
+    /// `what` is there after all, which is said if it was missing.
+    pub fn restored(&self, what: &'static str) {
+        if self.missing.lock().remove(what).is_some() {
+            tracing::info!("{what} is available now");
+        }
     }
 
     /// Say again every ten minutes what is missing, until cancelled.

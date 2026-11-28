@@ -183,6 +183,10 @@ the read that fetches another machine's file takes as long as the fetch.
 `rview_fs_inodes`: the inodes the kernel holds of the mount, each with its path in
 rview-fs's memory.
 
+An address that is taken does not end rview-fs: it runs without metrics, says so, and
+tries the address every second. An rview-fs that was killed holds its address until the
+kernel has freed its memory, and the next one starts in that time.
+
 ## Benchmarks
 
 `bench/bench.py` plays two machines on one host: two rview-fs, each with its own export

@@ -19,8 +19,8 @@ their files on [NATS](https://nats.io).
   union of every machine's export (`--mount`).
 - Whatever writes into an export announces each file it adds or deletes on NATS. Each
   rview-fs keeps an index of every machine's files from those announcements, and lists a
-  machine's export when the machine shows up, again until it answers, and every 10
-  minutes (`--rescan-s`).
+  machine's export when the machine shows up, again until it answers, every 10 minutes
+  (`--rescan-s`), and when its connection to NATS is back after it was lost.
 - Opening a file of this machine hands the export's file to the kernel, which reads and
   maps it with no request to rview-fs. All the opens of a file share one backing file,
   the one the kernel allows a file at a time.
@@ -102,8 +102,8 @@ Whatever writes into an export follows three rules:
   or serves it. Write a file under a temporary name (`.data.bin.k3j.tmp`), then link or
   rename it to its shared name once it is complete; it never changes after that.
 - Announce every file that becomes visible or goes away, on NATS (below). rview-fs also
-  lists every machine when it shows up and every 10 minutes (`--rescan-s`), so an
-  announcement lost on the way only makes a file late.
+  lists every machine when it shows up, every 10 minutes (`--rescan-s`) and when its
+  connection to NATS is back, so an announcement lost on the way only makes a file late.
 - A machine that holds a file at some path holds the same bytes there as every other
   machine that holds one.
 

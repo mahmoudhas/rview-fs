@@ -5,17 +5,21 @@
 //!   `{subject}.nodes`   each rview-fs heartbeats its node and how velo reaches it
 //!
 //! A node that shows up, new or restarted, is listed whole, and again until it answers;
-//! every node is listed again every few minutes, so an announcement lost on the way is
-//! only late. A node that stops heartbeating is gone, and so are its files.
+//! every node is listed again every few minutes, and when NATS is back after it was
+//! away, so an announcement lost on the way is only late. A node that stops heartbeating
+//! is gone, and so are its files.
 
 use std::collections::HashMap;
+use std::future::{Ready, ready};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use parking_lot::RwLockWriteGuard;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use velo::{InstanceId, PeerInfo};
 
@@ -250,10 +254,26 @@ pub async fn watch_nodes(
     }
 }
 
-/// Our own export and every node's, again every `every`, until cancelled.
+/// What the NATS client calls at each of its events: `back` is notified when the
+/// connection is made again after it was lost, and not when it is first made.
+pub fn reconnects(back: Arc<Notify>) -> impl Fn(async_nats::Event) -> Ready<()> + Send + Sync {
+    let connected_before = AtomicBool::new(false);
+    move |event| {
+        if matches!(event, async_nats::Event::Connected)
+            && connected_before.swap(true, Ordering::Relaxed)
+        {
+            back.notify_one();
+        }
+        ready(())
+    }
+}
+
+/// Our own export and every node's, again every `every` and whenever `nats_back` is
+/// notified, until cancelled.
 pub async fn rescan(
     state: Arc<State>,
     every: Duration,
+    nats_back: Arc<Notify>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(every);
@@ -262,6 +282,11 @@ pub async fn rescan(
         tokio::select! {
             () = cancel.cancelled() => return Ok(()),
             _ = tick.tick() => {}
+            () = nats_back.notified() => {
+                // What was announced while it was away was never heard.
+                tracing::info!("NATS is back; listing every node again");
+                tick.reset();
+            }
         }
         scan_local(&state).await?;
         let peers: Vec<(NodeId, InstanceId)> = {

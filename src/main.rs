@@ -26,6 +26,7 @@ use rview_fs::state::State;
 use rview_fs::used::{self, Used};
 use rview_fs::{metrics, remote, sync, transfer};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use velo::observability::VeloMetrics;
@@ -290,7 +291,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         read_bytes,
         ops,
     });
-    let nats = async_nats::connect(&args.nats)
+    let nats_back = Arc::new(Notify::new());
+    let nats = async_nats::ConnectOptions::new()
+        .event_callback(sync::reconnects(Arc::clone(&nats_back)))
+        .connect(&args.nats)
         .await
         .with_context(|| format!("connecting to {}", args.nats))?;
     // Before the export is scanned, so that what is announced during the scan waits in
@@ -320,6 +324,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     tasks.spawn(sync::rescan(
         Arc::clone(&state),
         Duration::from_secs(args.rescan_s),
+        nats_back,
         cancel.clone(),
     ));
     if let Some(addr) = args.metrics {

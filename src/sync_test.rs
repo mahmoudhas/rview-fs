@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use futures::FutureExt as _;
 use velo::Velo;
 
 use super::*;
@@ -7,7 +8,7 @@ use crate::cache::Key;
 use crate::held::Held;
 use crate::index::{Entry, EntryKind};
 use crate::remote::{Remote, RemoteFile};
-use crate::state::testing::{state, velo};
+use crate::state::testing::{state, state_of, velo};
 
 #[test]
 fn hidden_files_being_written_are_not_taken() {
@@ -213,4 +214,43 @@ async fn the_listing_of_a_node_that_went_or_restarted_is_dropped() {
     state.nodes.write().heard(b.clone(), answers);
     list_node(&state, &b, answers).await.unwrap();
     assert_eq!(state.index.read().file_count(), 1);
+}
+
+#[test]
+fn nats_is_told_back_when_connected_again_and_not_when_first_connected() {
+    let back = Arc::new(Notify::new());
+    let event = reconnects(Arc::clone(&back));
+    drop(event(async_nats::Event::Connected));
+    assert!(back.notified().now_or_never().is_none());
+    drop(event(async_nats::Event::Disconnected));
+    assert!(back.notified().now_or_never().is_none());
+    drop(event(async_nats::Event::Connected));
+    assert!(back.notified().now_or_never().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_nobody_announced_is_listed_once_nats_is_back() {
+    let export = export_of_one_file();
+    let state = state_of(velo().await, export.path().to_owned(), 0);
+    let (back, cancel) = (Arc::new(Notify::new()), CancellationToken::new());
+    // The next rescan by the clock is an hour away.
+    let rescans = tokio::spawn(rescan(
+        Arc::clone(&state),
+        Duration::from_secs(3600),
+        Arc::clone(&back),
+        cancel.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(state.index.read().lookup("x.bin").is_none());
+    back.notify_one();
+    let listed = async {
+        while state.index.read().lookup("x.bin").is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), listed)
+        .await
+        .expect("listed once NATS was back");
+    cancel.cancel();
+    rescans.await.unwrap().unwrap();
 }

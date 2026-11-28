@@ -286,3 +286,44 @@ async fn opening_a_file_of_another_node_from_memory_notes_it_for_its_node() {
     assert_eq!(noted.len(), 1);
     assert!(noted[&key.node].contains(&key.path));
 }
+
+/// A request as the kernel writes it to /dev/fuse: its header, then `body`.
+fn request(opcode: u32, nodeid: u64, body: &[u64]) -> Vec<u8> {
+    let len = (size_of::<fuse_in_header>() + 8 * body.len()) as u32;
+    let mut request = [len.to_ne_bytes(), opcode.to_ne_bytes()].concat();
+    request.extend(
+        [7, nodeid, 0, 0]
+            .iter()
+            .flat_map(|word: &u64| word.to_ne_bytes()),
+    );
+    request.extend(body.iter().flat_map(|word| word.to_ne_bytes()));
+    request
+}
+
+#[test]
+fn the_inodes_the_kernel_forgets_are_read_from_its_request_one_or_many() {
+    assert_eq!(forgotten(&request(FUSE_FORGET, 5, &[3])), [(5, 3)]);
+    // Two of them, counted in the first half of the word after the header.
+    let many = request(FUSE_BATCH_FORGET, 0, &[2, 5, 3, 9, 1]);
+    assert_eq!(forgotten(&many), [(5, 3), (9, 1)]);
+    // Cut short, it forgets what is whole.
+    assert_eq!(forgotten(&many[..many.len() - 8]), [(5, 3)]);
+    // An interrupt of a call is nothing to forget.
+    assert!(forgotten(&request(36, 0, &[7])).is_empty());
+    assert!(forgotten(&[]).is_empty());
+}
+
+#[test]
+fn an_inode_is_counted_until_every_lookup_of_it_is_forgotten() {
+    let mut inodes = Inodes::new();
+    let ino = inodes.remember("d/x.bin");
+    assert_eq!(inodes.remember("d/x.bin"), ino);
+    assert_eq!(inodes.held.get(), 1);
+    inodes.forget(ino, 1);
+    assert_eq!(
+        (inodes.held.get(), inodes.path(ino).as_deref()),
+        (1, Some("d/x.bin"))
+    );
+    inodes.forget(ino, 1);
+    assert_eq!((inodes.held.get(), inodes.path(ino)), (0, None));
+}

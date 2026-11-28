@@ -334,7 +334,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tasks.spawn(metrics::serve(listener, registry.clone(), cancel.clone()));
     }
     tasks.spawn(log_transfer_paths(
-        registry,
+        registry.clone(),
         pinned,
         Arc::clone(&degraded),
         cancel.clone(),
@@ -376,6 +376,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tokio::runtime::Handle::current(),
         passthrough.clone(),
     );
+    fs.register(&registry)?;
+    fs.read_forgets(session.fuse_fd(), args.mount.clone())?;
     let (ended_tx, ended) = tokio::sync::oneshot::channel();
     let fuse = std::thread::Builder::new()
         .name("rview-fuse".into())

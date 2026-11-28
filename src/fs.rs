@@ -33,12 +33,15 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::FileExt as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use fractal_fuse::abi::{
-    FOPEN_KEEP_CACHE, FOPEN_PASSTHROUGH, FUSE_ROOT_ID, fuse_dirent_size, fuse_direntplus_size,
+    FOPEN_KEEP_CACHE, FOPEN_PASSTHROUGH, FUSE_BATCH_FORGET, FUSE_FORGET, FUSE_ROOT_ID,
+    fuse_batch_forget_in, fuse_dirent_size, fuse_direntplus_size, fuse_in_header,
 };
 use fractal_fuse::{
     DirectoryEntry, DirectoryEntryPlus, EIO, EISDIR, ENOENT, Errno, FileAttr, FileHandleId,
@@ -46,6 +49,7 @@ use fractal_fuse::{
     Request, Timestamp,
 };
 use parking_lot::Mutex;
+use prometheus::{IntGauge, Registry};
 
 use bytes::Bytes;
 
@@ -59,14 +63,17 @@ use crate::used;
 
 // Files never change once written, but they come and go.
 const TTL: Duration = Duration::from_secs(1);
-
+/// What a read from /dev/fuse is given room for at first. The kernel refuses a read with
+/// less room than its largest write to the file system takes, 1 MiB and its headers as
+/// fractal-fuse sets that, though a forget takes a page at the most.
+const DEV_REQUEST_ROOM: usize = (1 << 20) + (1 << 16);
 pub struct RviewFs {
     state: Arc<State>,
     runtime: tokio::runtime::Handle,
     passthrough: Option<Arc<Passthrough>>,
     // Taken by every request for a moment, on fractal-fuse's threads; never across an
     // await.
-    inodes: Mutex<Inodes>,
+    inodes: Arc<Mutex<Inodes>>,
     open: Mutex<OpenFiles>,
     dirs: Mutex<OpenDirs>,
 }
@@ -76,14 +83,21 @@ struct Inodes {
     by_ino: HashMap<u64, (String, u64)>,
     by_path: HashMap<String, u64>,
     next: u64,
+    /// How many there are, as a metric.
+    held: IntGauge,
 }
 
 impl Inodes {
     fn new() -> Self {
+        let held = IntGauge::new(
+            "rview_fs_inodes",
+            "The inodes the kernel holds of the mount, each with its path here.",
+        );
         Self {
             by_ino: HashMap::from([(FUSE_ROOT_ID, (String::new(), 1))]),
             by_path: HashMap::from([(String::new(), FUSE_ROOT_ID)]),
             next: FUSE_ROOT_ID + 1,
+            held: held.expect("a valid metric"),
         }
     }
 
@@ -103,6 +117,7 @@ impl Inodes {
         self.next += 1;
         self.by_ino.insert(ino, (path.to_owned(), 1));
         self.by_path.insert(path.to_owned(), ino);
+        self.held.inc();
         ino
     }
 
@@ -118,6 +133,7 @@ impl Inodes {
             let path = path.clone();
             self.by_ino.remove(&ino);
             self.by_path.remove(&path);
+            self.held.dec();
         }
     }
 }
@@ -276,6 +292,35 @@ fn attr(ino: u64, entry: &Entry) -> FileAttr {
     }
 }
 
+/// The inodes a request read from /dev/fuse says to forget, each with the lookups it was
+/// held by; none when it is another request (an interrupt of a call, which needs no
+/// answer).
+fn forgotten(request: &[u8]) -> Vec<(u64, u64)> {
+    let word = |at: usize| {
+        request
+            .get(at..at + 8)
+            .map(|b| u64::from_ne_bytes(b.try_into().unwrap()))
+    };
+    let header = size_of::<fuse_in_header>();
+    let opcode = request
+        .get(4..8)
+        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()));
+    match opcode {
+        // The inode is the header's, the lookups all there is after it.
+        Some(FUSE_FORGET) => word(16).zip(word(header)).into_iter().collect(),
+        Some(FUSE_BATCH_FORGET) => {
+            let entries = header + size_of::<fuse_batch_forget_in>();
+            let count = request
+                .get(header..header + 4)
+                .map(|b| u32::from_ne_bytes(b.try_into().unwrap()));
+            (0..count.unwrap_or(0) as usize)
+                .map_while(|i| word(entries + 16 * i).zip(word(entries + 16 * i + 8)))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn io_errno(e: &io::Error) -> Errno {
     e.raw_os_error().unwrap_or(EIO)
 }
@@ -291,10 +336,70 @@ impl RviewFs {
             state,
             runtime,
             passthrough,
-            inodes: Mutex::new(Inodes::new()),
+            inodes: Arc::new(Mutex::new(Inodes::new())),
             open: Mutex::default(),
             dirs: Mutex::default(),
         }
+    }
+
+    /// Read what the kernel sends on /dev/fuse itself, `fuse`, and not through the ring,
+    /// on a thread of its own until the mount at `mount` is gone. As of Linux 6.14 it
+    /// forgets inodes there, which nothing read: no inode was ever forgotten here, and
+    /// the path of every file ever looked up stayed in memory.
+    pub fn read_forgets(&self, fuse: Arc<OwnedFd>, mount: PathBuf) -> io::Result<()> {
+        let inodes = Arc::clone(&self.inodes);
+        let read = move || {
+            // The first request on /dev/fuse is the session's own to read: not before
+            // the mount answers.
+            while std::fs::metadata(&mount).is_err() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let mut request = vec![0u8; DEV_REQUEST_ROOM];
+            loop {
+                let (fd, buf) = (fuse.as_raw_fd(), request.as_mut_ptr().cast());
+                // SAFETY: `buf` is `request`'s own memory, of the length given.
+                let read = unsafe { libc::read(fd, buf, request.len()) };
+                let Ok(len) = usize::try_from(read) else {
+                    match io::Error::last_os_error() {
+                        // A call given up before it was read, or a signal.
+                        e if [libc::ENOENT, libc::EINTR, libc::EAGAIN]
+                            .map(Some)
+                            .contains(&e.raw_os_error()) =>
+                        {
+                            continue;
+                        }
+                        // Too little room for the kernel's largest write.
+                        e if e.raw_os_error() == Some(libc::EINVAL)
+                            && request.len() < 64 * DEV_REQUEST_ROOM =>
+                        {
+                            request = vec![0u8; 2 * request.len()];
+                            continue;
+                        }
+                        // Unmounted.
+                        e if e.raw_os_error() == Some(libc::ENODEV) => return,
+                        e => {
+                            tracing::error!(
+                                "reading the kernel's forgets failed, so the path of every inode it forgets from now on stays in memory: {e}"
+                            );
+                            return;
+                        }
+                    }
+                };
+                let mut inodes = inodes.lock();
+                for (ino, lookups) in forgotten(&request[..len]) {
+                    inodes.forget(ino, lookups);
+                }
+            }
+        };
+        std::thread::Builder::new()
+            .name("rview-forgets".into())
+            .spawn(read)?;
+        Ok(())
+    }
+
+    /// The count of the inodes the kernel holds, as a metric of `registry`.
+    pub fn register(&self, registry: &Registry) -> prometheus::Result<()> {
+        registry.register(Box::new(self.inodes.lock().held.clone()))
     }
 
     fn path(&self, ino: InodeId) -> FsResult<String> {

@@ -177,6 +177,8 @@ they moved on, `rdma` or `tcp`, which velo does not count; and
 calls (`lookup`, `getattr`, `open`, `read`, `opendir`, `readdir`, `readdirplus`), those
 that failed too. A file passed through is read by the kernel itself and counts no `read`;
 the read that fetches another machine's file takes as long as the fetch.
+`rview_fs_inodes`: the inodes the kernel holds of the mount, each with its path in
+rview-fs's memory.
 
 ## Benchmarks
 

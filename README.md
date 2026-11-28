@@ -163,10 +163,11 @@ UCX_NET_DEVICES=mlx5_0:1 \
 | `--bind` | Where velo listens for the other machines (`0.0.0.0:0`) |
 | `--rescan-s` (`RVIEW_RESCAN_S`) | Seconds between two listings of every machine's export, this one's own too (600): the most a file whose announcement was lost is late by |
 | `--metrics` (`RVIEW_METRICS`) | Where to serve Prometheus metrics, such as `127.0.0.1:9300` (off) |
-| `--fuse-workers`, `--fuse-queue-depth` | Threads serving FUSE requests (8), and requests in flight per kernel queue (8) |
-| `--fuse-max-background` | Reads the kernel has in flight on the mount at the most, for all its readers together (16); a read of another machine's file not fetched yet is in flight until the fetch is done, and a further read waits |
+| `--fuse-workers` (`RVIEW_FUSE_WORKERS`), `--fuse-queue-depth` | Threads serving FUSE requests (8), and requests in flight per kernel queue (8) |
+| `--fuse-max-background` (`RVIEW_FUSE_MAX_BACKGROUND`) | Reads the kernel has in flight on the mount at the most, for all its readers together (16); a read of another machine's file not fetched yet is in flight until the fetch is done, and a further read waits |
 | `--no-passthrough` | Serve the reads of this machine's files too |
 | `--no-rdma` | Move files between machines over TCP |
+| `--rdma-devices` (`RVIEW_RDMA_DEVICES`) | The RDMA devices files move over, as UCX names them (`mlx5_0:1`): `UCX_NET_DEVICES` for this rview-fs alone, where it gets that variable together with programs whose devices are not to change |
 
 It needs root, or `CAP_SYS_ADMIN`, `/dev/fuse` and `fusermount3`. On SIGTERM it detaches
 the mount, leaves the other machines and exits. It logs how its transfers went: `rdma/ok`,

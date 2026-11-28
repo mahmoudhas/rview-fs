@@ -66,6 +66,11 @@ struct Args {
     /// Move files between machines over TCP, not RDMA.
     #[arg(long)]
     no_rdma: bool,
+    /// The RDMA devices files move over, as UCX names them (`mlx5_0:1`, more with commas):
+    /// UCX_NET_DEVICES for this rview-fs alone, where it gets that variable together with
+    /// programs whose devices are not to change.
+    #[arg(long, env = "RVIEW_RDMA_DEVICES")]
+    rdma_devices: Option<String>,
     /// Where velo listens for the other machines.
     #[arg(long, default_value = "0.0.0.0:0")]
     bind: SocketAddr,
@@ -77,7 +82,7 @@ struct Args {
     #[arg(long, env = "RVIEW_RESCAN_S", default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
     rescan_s: u64,
     /// Threads that serve FUSE requests.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, env = "RVIEW_FUSE_WORKERS", default_value_t = 8)]
     fuse_workers: usize,
     /// FUSE requests in flight per kernel queue. The kernel has a queue per possible CPU
     /// and every one gets this many 1 MiB buffers before the mount serves all CPUs.
@@ -86,7 +91,7 @@ struct Args {
     /// Reads the kernel has in flight on the mount at the most, for all who read through
     /// it together (FUSE's max_background); a further read waits for one to end. A read of
     /// another machine's file not fetched yet is in flight for as long as the fetch takes.
-    #[arg(long, default_value_t = rview_fs::fs::READS_IN_FLIGHT, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, env = "RVIEW_FUSE_MAX_BACKGROUND", default_value_t = rview_fs::fs::READS_IN_FLIGHT, value_parser = clap::value_parser!(u16).range(1..))]
     fuse_max_background: u16,
 }
 
@@ -100,6 +105,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if let Some(devices) = &args.rdma_devices {
+        tracing::info!(devices, "files move over these RDMA devices");
+        // SAFETY: no other thread runs yet: the runtime and its threads are built below.
+        unsafe { std::env::set_var("UCX_NET_DEVICES", devices) };
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

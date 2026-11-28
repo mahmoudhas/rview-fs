@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use super::leave_while_detaching;
+use clap::CommandFactory as _;
+
+use super::{Args, leave_while_detaching};
 
 #[tokio::test]
 async fn the_other_machines_are_left_while_the_unmount_still_runs() {
@@ -16,4 +18,20 @@ async fn the_other_machines_are_left_while_the_unmount_still_runs() {
         detached,
         "the unmount was waited for before the others were left"
     );
+}
+
+#[test]
+fn what_a_deployment_tunes_is_read_from_the_environment_too() {
+    let command = Args::command();
+    let variable = |flag: &str| {
+        let arg = command.get_arguments().find(|a| a.get_id() == flag);
+        arg.and_then(|a| a.get_env()?.to_str())
+    };
+    assert_eq!(variable("rescan_s"), Some("RVIEW_RESCAN_S"));
+    assert_eq!(
+        variable("fuse_max_background"),
+        Some("RVIEW_FUSE_MAX_BACKGROUND")
+    );
+    assert_eq!(variable("fuse_workers"), Some("RVIEW_FUSE_WORKERS"));
+    assert_eq!(variable("rdma_devices"), Some("RVIEW_RDMA_DEVICES"));
 }
